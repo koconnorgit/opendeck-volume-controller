@@ -30,7 +30,9 @@ Long pressing the volume app icon will set it as ignored and remove that specifi
 
 ## ToDo:
 
-- [ ] Make this work on the SD+ so it responds to the dials and shows volume on the LCD?
-- [ ] Figure out a layout for the 2-row SDs 
-  - Thinking about adding an extra action here that would just be +/- volume 
-- [ ] Fix bugs
+ - Support for dials and mini devices (2x3 grid cells).
+ - Manual setup for specifying which specific app would live on what column.
+
+I'm afraid I do not have a timeline for the ToDo list features or if I will ever get around to finish them due to time constraints.
+
+Contributions are welcome!
