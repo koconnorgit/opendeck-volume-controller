@@ -17,12 +17,16 @@ Take full control of your sound experience with fine-tuned per-app volume manage
 - **Auto-Detection**: Automatically discovers and tracks running audio applications
 - **App Icons**: Displays application icons for easy identification
 - **Real-time Updates**: Monitors PulseAudio events and updates the interface dynamically
+- **Ignore apps**: Exclude specific apps from showing in the volume controller
 
 ## Usage
 
 Drag the `Volume Control Auto Grid` action across the SD grid. This was tested and developed with the SD3x5 in mind, so at least one full column (3 actions per column) is needed to show one volume mixer, where the first action button is the mixer icon together with the mute/unmute button, the second is Vol+ and the remaining button is Vol-.
 
 After setting your grid, switch profiles and return to your volume controller profile to kick things off.
+
+Pressing the volume app icon will mute it.
+Long pressing the volume app icon will set it as ignored and remove that specific volume bar from the device. To revert this action click on any volume controller grid cell in the opendeck UI and remove it from the list of ignored apps.
 
 ## ToDo:
 
