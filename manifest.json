@@ -22,6 +22,16 @@
       "Name": "Volume Control Auto Grid",
       "UUID": "com.victormarin.volume-controller.volctrl",
       "Tooltip": "Volume controller grid part, fill your SD with this",
+      "Controllers": ["Keypad", "Encoder"],
+      "Encoder": {
+        "layout": "$B1",
+        "TriggerDescription": {
+          "Rotate": "Adjust volume",
+          "Push": "Toggle mute",
+          "Touch": "Toggle mute",
+          "LongTouch": "Dismiss stream"
+        }
+      },
       "States": [
         {}
       ]

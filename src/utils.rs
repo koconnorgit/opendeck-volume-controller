@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::gfx::TRANSPARENT_ICON;
 use crate::mixer::{self, MixerChannel};
+use crate::mixer::ENCODER_TO_CHANNEL_MAP;
 use crate::plugin::{COLUMN_TO_CHANNEL_MAP, VolumeControllerAction};
 
 const MAX_TITLE_CHARS_BEFORE_TRUNCATION: usize = 8;
@@ -79,47 +80,79 @@ pub async fn get_device_row_count() -> Option<u8> {
 
 pub async fn update_stream_deck_buttons() {
     let column_map = COLUMN_TO_CHANNEL_MAP.lock().await;
+    let encoder_map = ENCODER_TO_CHANNEL_MAP.lock().await;
     let mut channels = mixer::MIXER_CHANNELS.lock().await;
-    let row_count = get_device_row_count().await;
 
     for instance in visible_instances(VolumeControllerAction::UUID).await {
-        let Some(coords) = instance.coordinates else {
-            continue;
-        };
-        let sd_column = coords.column;
+        if instance.controller == "Encoder" {
+            let dial_pos = instance
+                .coordinates
+                .as_ref()
+                .map(|c| c.column)
+                .unwrap_or(0);
 
-        let Some(&channel_index) = column_map.get(&sd_column) else {
-            continue;
-        };
+            let Some(&channel_index) = encoder_map.get(&dial_pos) else {
+                cleanup_encoder_dial(&instance).await;
+                continue;
+            };
 
-        let Some(channel) = channels.get_mut(&channel_index) else {
-            if let Some(rows) = row_count {
-                if rows >= 3 {
-                    cleanup_sd_column(&instance).await;
-                } else {
-                    // TODO check if there are knobs/dials too and call appropriate cleanup fn
-                    // update_sd_column_with_knob(&instance).await;
-                }
+            let Some(channel) = channels.get_mut(&channel_index) else {
+                cleanup_encoder_dial(&instance).await;
+                continue;
+            };
+
+            channel.dial_id = Some(instance.instance_id.clone());
+            update_encoder_dial(channel, &instance).await;
+        } else {
+            let Some(coords) = instance.coordinates else {
+                continue;
+            };
+
+            let Some(&channel_index) = column_map.get(&coords.column) else {
+                continue;
+            };
+
+            let Some(channel) = channels.get_mut(&channel_index) else {
+                cleanup_sd_column(&instance).await;
+                continue;
+            };
+
+            match coords.row {
+                0 => channel.header_id = Some(instance.instance_id.clone()),
+                1 => channel.upper_vol_btn_id = Some(instance.instance_id.clone()),
+                2 => channel.lower_vol_btn_id = Some(instance.instance_id.clone()),
+                _ => {}
             }
-            continue;
-        };
 
-        match coords.row {
-            0 => channel.header_id = Some(instance.instance_id.clone()),
-            1 => channel.upper_vol_btn_id = Some(instance.instance_id.clone()),
-            2 => channel.lower_vol_btn_id = Some(instance.instance_id.clone()),
-            _ => {}
-        }
-
-        if let Some(rows) = row_count {
-            if rows >= 3 {
-                update_sd_column(channel, &instance).await;
-            } else {
-                // TODO same logic as in cleanup for knobs/dials (appropriate update fn)
-                // update_sd_column_with_knob(&instance).await;
-            }
+            update_sd_column(channel, &instance).await;
         }
     }
+}
+
+pub async fn update_encoder_dial(channel: &MixerChannel, instance: &Instance) {
+    let icon = if channel.mute {
+        &channel.icon_uri_mute
+    } else {
+        &channel.icon_uri
+    };
+    match crate::gfx::get_encoder_lcd_data_uri(icon, channel.vol_percent, channel.mute) {
+        Ok(uri) => {
+            let _ = instance.set_image(Some(uri), None).await;
+        }
+        Err(e) => eprintln!("Failed to render encoder LCD image: {e}"),
+    }
+    // Show app name in the OpenDeck UI panel
+    let display_name = if channel.is_multi_sink_app {
+        channel.sink_name.clone().unwrap_or_else(|| channel.app_name.clone())
+    } else {
+        channel.app_name.clone()
+    };
+    let _ = instance.set_title(Some(display_name), None).await;
+}
+
+pub async fn cleanup_encoder_dial(instance: &Instance) {
+    let _ = instance.set_title(Some(""), None).await;
+    let _ = instance.set_image(Some(TRANSPARENT_ICON.as_str()), None).await;
 }
 
 pub async fn update_header(instance: &Instance, channel: &MixerChannel) {

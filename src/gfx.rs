@@ -351,3 +351,105 @@ fn get_volume_bar_base64_split(volume_percent: f32) -> Result<(String, String)> 
 
     Ok((top_base64, bottom_base64))
 }
+
+/// Generate a 200x100 encoder LCD image showing the app icon and volume bar.
+/// The image is stretched to fill the full encoder zone by OpenDeck.
+///
+/// Layout:
+///   - Left 90px: app icon (80x80, centered vertically, 5px from left)
+///   - Right 110px: vertical volume bar (10px wide, full height, filled from bottom)
+///   - Thin horizontal rule separating icon from bar
+///   - If muted: everything dimmed to ~30% brightness
+pub fn get_encoder_lcd_data_uri(
+    icon_data_uri: &str,
+    vol_percent: f32,
+    muted: bool,
+) -> Result<String> {
+    const W: u32 = 200;
+    const H: u32 = 100;
+
+    let mut img = RgbaImage::from_pixel(W, H, Rgba([18, 18, 18, 255]));
+
+    // --- Draw app icon on the left ---
+    let icon_bytes_b64 = icon_data_uri
+        .split_once(',')
+        .map(|(_, b)| b)
+        .unwrap_or("");
+    if let Ok(icon_bytes) = base64::engine::general_purpose::STANDARD.decode(icon_bytes_b64) {
+        if let Ok(icon_img) = image::load_from_memory(&icon_bytes) {
+            let icon = icon_img.resize(80, 80, image::imageops::FilterType::Lanczos3);
+            let icon_rgba = icon.to_rgba8();
+            let x_off = 5i32;
+            let y_off = ((H as i32) - (icon_rgba.height() as i32)) / 2;
+            for (px, py, pixel) in icon_rgba.enumerate_pixels() {
+                let x = px as i32 + x_off;
+                let y = py as i32 + y_off;
+                if x >= 0 && y >= 0 && x < W as i32 && y < H as i32 {
+                    let a = pixel[3] as f32 / 255.0;
+                    let bg = img.get_pixel(x as u32, y as u32);
+                    let r = (pixel[0] as f32 * a + bg[0] as f32 * (1.0 - a)) as u8;
+                    let g = (pixel[1] as f32 * a + bg[1] as f32 * (1.0 - a)) as u8;
+                    let b = (pixel[2] as f32 * a + bg[2] as f32 * (1.0 - a)) as u8;
+                    img.put_pixel(x as u32, y as u32, Rgba([r, g, b, 255]));
+                }
+            }
+        }
+    }
+
+    // --- Separator line ---
+    for y in 5..H - 5 {
+        img.put_pixel(90, y, Rgba([60, 60, 60, 255]));
+    }
+
+    // --- Volume bar (vertical, right side) ---
+    // Bar occupies x=100..190, shows filled portion from bottom
+    let bar_x = 100u32;
+    let bar_w = 80u32;
+    let bar_top = 8u32;
+    let bar_bot = H - 8;
+    let bar_h = bar_bot - bar_top;
+    let filled_h = (bar_h as f32 * (vol_percent / 100.0).clamp(0.0, 1.0)) as u32;
+
+    // Background of bar
+    for y in bar_top..bar_bot {
+        for x in bar_x..bar_x + bar_w {
+            img.put_pixel(x, y, Rgba([40, 40, 40, 255]));
+        }
+    }
+
+    // Filled portion (bottom-up)
+    let fill_color = if muted {
+        Rgba([90, 90, 90, 255])
+    } else {
+        Rgba([80, 200, 120, 255])
+    };
+    let fill_start = bar_bot.saturating_sub(filled_h);
+    for y in fill_start..bar_bot {
+        for x in bar_x..bar_x + bar_w {
+            img.put_pixel(x, y, fill_color);
+        }
+    }
+
+    // Thin highlight line at top of fill
+    if filled_h > 0 && fill_start < bar_bot {
+        for x in bar_x..bar_x + bar_w {
+            img.put_pixel(x, fill_start, Rgba([160, 255, 200, 255]));
+        }
+    }
+
+    // --- Mute dim overlay ---
+    if muted {
+        for pixel in img.pixels_mut() {
+            pixel[0] = (pixel[0] as f32 * 0.35) as u8;
+            pixel[1] = (pixel[1] as f32 * 0.35) as u8;
+            pixel[2] = (pixel[2] as f32 * 0.35) as u8;
+        }
+    }
+
+    let mut buf = Vec::new();
+    img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)?;
+    Ok(format!(
+        "data:image/png;base64,{}",
+        general_purpose::STANDARD.encode(&buf)
+    ))
+}

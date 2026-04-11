@@ -8,6 +8,7 @@ pub struct MixerChannel {
     pub header_id: Option<String>,
     pub upper_vol_btn_id: Option<String>,
     pub lower_vol_btn_id: Option<String>,
+    pub dial_id: Option<String>,
     pub uid: u32,
     pub app_name: String,
     pub sink_name: Option<String>,
@@ -21,6 +22,10 @@ pub struct MixerChannel {
 }
 
 pub static MIXER_CHANNELS: LazyLock<Mutex<HashMap<u8, MixerChannel>>> =
+    LazyLock::new(|| Mutex::const_new(HashMap::new()));
+
+/// Maps encoder dial position → mixer channel index (independent from button columns)
+pub static ENCODER_TO_CHANNEL_MAP: LazyLock<Mutex<HashMap<u8, u8>>> =
     LazyLock::new(|| Mutex::const_new(HashMap::new()));
 
 pub async fn create_mixer_channels(
@@ -45,6 +50,7 @@ pub async fn create_mixer_channels(
                 header_id: None,
                 upper_vol_btn_id: None,
                 lower_vol_btn_id: None,
+                dial_id: None,
                 uid: app.uid,
                 app_name: app.app_name.clone(),
                 sink_name: app.sink_name.clone(),
@@ -114,6 +120,7 @@ pub async fn update_mixer_channels(
                     header_id: None,
                     upper_vol_btn_id: None,
                     lower_vol_btn_id: None,
+                    dial_id: None,
                     uid: app.uid,
                     app_name: app.app_name,
                     sink_name: app.sink_name,

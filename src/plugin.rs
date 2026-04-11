@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     audio::{self, pulse::pulse_monitor::refresh_audio_applications, *},
     gfx::{self},
-    mixer,
+    mixer::{self, ENCODER_TO_CHANNEL_MAP},
     utils::{self, ButtonPressControl},
 };
 use std::{collections::HashMap, sync::LazyLock};
@@ -82,15 +82,18 @@ impl Action for VolumeControllerAction {
         instance: &Instance,
         _: &Self::Settings,
     ) -> OpenActionResult<()> {
-        utils::cleanup_sd_column(instance).await;
-
         let Some(coords) = instance.coordinates else {
             println!("Warning: Instance {} has no coordinates", instance.instance_id);
             return Ok(());
         };
 
-        let mut column_map = COLUMN_TO_CHANNEL_MAP.lock().await;
-        column_map.remove(&coords.column);
+        if instance.controller == "Encoder" {
+            utils::cleanup_encoder_dial(instance).await;
+            ENCODER_TO_CHANNEL_MAP.lock().await.remove(&coords.column);
+        } else {
+            utils::cleanup_sd_column(instance).await;
+            COLUMN_TO_CHANNEL_MAP.lock().await.remove(&coords.column);
+        }
 
         Ok(())
     }
@@ -142,12 +145,26 @@ impl Action for VolumeControllerAction {
             return Ok(());
         };
 
+        if instance.controller == "Encoder" {
+            let mut encoder_map = ENCODER_TO_CHANNEL_MAP.lock().await;
+            let mut channels = mixer::MIXER_CHANNELS.lock().await;
+            let dial_pos = coords.column;
+            let next_index = encoder_map.len() as u8;
+            let channel_index = *encoder_map.entry(dial_pos).or_insert(next_index);
+            match channels.get_mut(&channel_index) {
+                Some(channel) => {
+                    channel.dial_id = Some(instance.instance_id.clone());
+                    utils::update_encoder_dial(channel, instance).await;
+                }
+                None => utils::cleanup_encoder_dial(instance).await,
+            }
+            return Ok(());
+        }
+
+        // --- Keypad ---
         let mut column_map = COLUMN_TO_CHANNEL_MAP.lock().await;
         let mut channels = mixer::MIXER_CHANNELS.lock().await;
-
         let sd_column = coords.column;
-
-        // Calculate next index before entry() call to avoid borrow checker issue
         let next_index = column_map.len() as u8;
         let channel_index = *column_map.entry(sd_column).or_insert(next_index);
 
@@ -179,7 +196,7 @@ impl Action for VolumeControllerAction {
                     instance.set_image(Some(img), None).await?;
                 }
             }
-            _ => {} // Ignore other rows
+            _ => {}
         }
 
         Ok(())
@@ -331,6 +348,66 @@ impl Action for VolumeControllerAction {
                 _ => {}
             }
         }
+
+        Ok(())
+    }
+
+    async fn dial_rotate(
+        &self,
+        instance: &Instance,
+        _: &Self::Settings,
+        ticks: i16,
+        _pressed: bool,
+    ) -> OpenActionResult<()> {
+        let dial_pos = instance.coordinates.as_ref().map(|c| c.column).unwrap_or(0);
+        let encoder_map = ENCODER_TO_CHANNEL_MAP.lock().await;
+        let Some(&channel_index) = encoder_map.get(&dial_pos) else {
+            return Ok(());
+        };
+        drop(encoder_map);
+
+        let mut channels = mixer::MIXER_CHANNELS.lock().await;
+        let Some(channel) = channels.get_mut(&channel_index) else {
+            return Ok(());
+        };
+
+        let uid = channel.uid;
+        let is_device = channel.is_device;
+        let increment = VOLUME_INCREMENT * ticks.abs() as f64;
+
+        drop(channels);
+
+        let mut audio = audio::create();
+        if ticks > 0 {
+            let _ = audio.increase_volume(uid, increment, is_device);
+        } else if ticks < 0 {
+            let _ = audio.decrease_volume(uid, increment, is_device);
+        }
+
+        Ok(())
+    }
+
+    async fn dial_down(&self, instance: &Instance, _: &Self::Settings) -> OpenActionResult<()> {
+        let dial_pos = instance.coordinates.as_ref().map(|c| c.column).unwrap_or(0);
+        let encoder_map = ENCODER_TO_CHANNEL_MAP.lock().await;
+        let Some(&channel_index) = encoder_map.get(&dial_pos) else {
+            return Ok(());
+        };
+        drop(encoder_map);
+
+        let mut channels = mixer::MIXER_CHANNELS.lock().await;
+        let Some(channel) = channels.get_mut(&channel_index) else {
+            return Ok(());
+        };
+
+        channel.mute = !channel.mute;
+        let uid = channel.uid;
+        let mute = channel.mute;
+        let is_device = channel.is_device;
+        drop(channels);
+
+        let mut audio = audio::create();
+        let _ = audio.mute_volume(uid, mute, is_device);
 
         Ok(())
     }
