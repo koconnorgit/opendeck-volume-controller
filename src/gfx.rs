@@ -1,3 +1,4 @@
+use ab_glyph::{Font, FontArc, Glyph, PxScale, ScaleFont, point};
 use anyhow::Result;
 use base64::{Engine as _, engine::general_purpose};
 use image::{Rgba, RgbaImage};
@@ -5,6 +6,104 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io::Cursor;
 use std::sync::{LazyLock, Mutex, OnceLock};
+
+/// Lazily-loaded sans-serif bold font. Tries a list of common Linux system paths;
+/// returns None if none are readable, in which case text rendering is a no-op.
+static TITLE_FONT: LazyLock<Option<FontArc>> = LazyLock::new(|| {
+    let paths: &[&str] = &[
+        "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    ];
+    for path in paths {
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Ok(font) = FontArc::try_from_vec(bytes) {
+                return Some(font);
+            }
+        }
+    }
+    None
+});
+
+fn measure_text_width(font: &FontArc, text: &str, scale: PxScale) -> f32 {
+    let scaled = font.as_scaled(scale);
+    let mut width = 0.0f32;
+    let mut prev: Option<ab_glyph::GlyphId> = None;
+    for c in text.chars() {
+        let gid = font.glyph_id(c);
+        if let Some(p) = prev {
+            width += scaled.kern(p, gid);
+        }
+        width += scaled.h_advance(gid);
+        prev = Some(gid);
+    }
+    width
+}
+
+fn fit_text(font: &FontArc, text: &str, scale: PxScale, max_w: f32) -> String {
+    if measure_text_width(font, text, scale) <= max_w {
+        return text.to_string();
+    }
+    let mut s = text.to_string();
+    while measure_text_width(font, &s, scale) > max_w && !s.is_empty() {
+        s.pop();
+    }
+    s
+}
+
+/// Draw text horizontally centered within the rectangle
+/// (area_x, area_y, area_w, area_h), alpha-blended onto `img`.
+/// No-op if the system font is unavailable or the text is empty.
+fn draw_text_centered(img: &mut RgbaImage, text: &str, area_x: u32, area_y: u32, area_w: u32, size_px: f32, color: Rgba<u8>) {
+    let Some(font) = TITLE_FONT.as_ref() else {
+        return;
+    };
+    if text.is_empty() {
+        return;
+    }
+
+    let scale = PxScale::from(size_px);
+    let fitted = fit_text(font, text, scale, area_w as f32 - 4.0);
+    if fitted.is_empty() {
+        return;
+    }
+
+    let scaled = font.as_scaled(scale);
+    let ascent = scaled.ascent();
+    let width = measure_text_width(font, &fitted, scale);
+    let x_start = area_x as f32 + (area_w as f32 - width) / 2.0;
+    let y_baseline = area_y as f32 + ascent + 1.0;
+
+    let mut x_cursor = x_start;
+    let mut prev: Option<ab_glyph::GlyphId> = None;
+    for c in fitted.chars() {
+        let gid = font.glyph_id(c);
+        if let Some(p) = prev {
+            x_cursor += scaled.kern(p, gid);
+        }
+        let glyph: Glyph = gid.with_scale_and_position(scale, point(x_cursor, y_baseline));
+
+        if let Some(outlined) = font.outline_glyph(glyph) {
+            let bounds = outlined.px_bounds();
+            outlined.draw(|gx, gy, coverage| {
+                let px = bounds.min.x as i32 + gx as i32;
+                let py = bounds.min.y as i32 + gy as i32;
+                if px >= 0 && py >= 0 && (px as u32) < img.width() && (py as u32) < img.height() {
+                    let bg = *img.get_pixel(px as u32, py as u32);
+                    let a = coverage * (color[3] as f32 / 255.0);
+                    let r = (color[0] as f32 * a + bg[0] as f32 * (1.0 - a)) as u8;
+                    let g = (color[1] as f32 * a + bg[1] as f32 * (1.0 - a)) as u8;
+                    let b = (color[2] as f32 * a + bg[2] as f32 * (1.0 - a)) as u8;
+                    img.put_pixel(px as u32, py as u32, Rgba([r, g, b, bg[3]]));
+                }
+            });
+        }
+        x_cursor += scaled.h_advance(gid);
+        prev = Some(gid);
+    }
+}
 
 static VOLUME_BAR_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
@@ -352,38 +451,41 @@ fn get_volume_bar_base64_split(volume_percent: f32) -> Result<(String, String)> 
     Ok((top_base64, bottom_base64))
 }
 
-/// Generate a 200x100 encoder LCD image showing the app icon and volume bar.
-/// The image is stretched to fill the full encoder zone by OpenDeck.
+/// Generate a 100x100 encoder LCD image showing the app title, icon, and volume bar.
 ///
-/// Layout:
-///   - Left 90px: app icon (80x80, centered vertically, 5px from left)
-///   - Right 110px: vertical volume bar (10px wide, full height, filled from bottom)
-///   - Thin horizontal rule separating icon from bar
-///   - If muted: everything dimmed to ~30% brightness
-pub fn get_encoder_lcd_data_uri(
-    icon_data_uri: &str,
-    vol_percent: f32,
-    muted: bool,
-) -> Result<String> {
-    const W: u32 = 200;
+/// Layout (native canvas, top-left origin):
+///   - Title strip: y=0..28, x=0..88, Noto Sans Bold ~22px, centered, truncated to fit
+///   - Icon: 64x64 resized from source, centered in the (x=0..88, y=30..94) main area
+///   - Volume bar: x=88..98 (10px wide), y=4..96 (92px tall), filled bottom-up
+///   - If muted: entire image dimmed to ~35% brightness
+pub fn get_encoder_lcd_data_uri(icon_data_uri: &str, title: &str, vol_percent: f32, muted: bool) -> Result<String> {
+    const W: u32 = 100;
     const H: u32 = 100;
+    const TEXT_H: u32 = 28;
+    const CONTENT_W: u32 = 88; // leave 12px on the right for the volume bar
 
     let mut img = RgbaImage::from_pixel(W, H, Rgba([18, 18, 18, 255]));
 
-    // --- Draw app icon on the left ---
-    let icon_bytes_b64 = icon_data_uri
-        .split_once(',')
-        .map(|(_, b)| b)
-        .unwrap_or("");
+    // --- Title text at top ---
+    draw_text_centered(&mut img, title, 0, 0, CONTENT_W, 22.0, Rgba([220, 220, 220, 255]));
+
+    // --- App icon, centered in the main content area below the title ---
+    const ICON_SIZE: u32 = 64;
+    let icon_area_x = 0u32;
+    let icon_area_y = TEXT_H + 2; // 2px gap under title
+    let icon_area_w = CONTENT_W;
+    let icon_area_h = H - icon_area_y - 4; // 4px bottom padding
+    let icon_x_off = icon_area_x as i32 + ((icon_area_w as i32) - (ICON_SIZE as i32)) / 2;
+    let icon_y_off = icon_area_y as i32 + ((icon_area_h as i32) - (ICON_SIZE as i32)) / 2;
+
+    let icon_bytes_b64 = icon_data_uri.split_once(',').map(|(_, b)| b).unwrap_or("");
     if let Ok(icon_bytes) = base64::engine::general_purpose::STANDARD.decode(icon_bytes_b64) {
         if let Ok(icon_img) = image::load_from_memory(&icon_bytes) {
-            let icon = icon_img.resize(80, 80, image::imageops::FilterType::Lanczos3);
+            let icon = icon_img.resize(ICON_SIZE, ICON_SIZE, image::imageops::FilterType::Lanczos3);
             let icon_rgba = icon.to_rgba8();
-            let x_off = 5i32;
-            let y_off = ((H as i32) - (icon_rgba.height() as i32)) / 2;
             for (px, py, pixel) in icon_rgba.enumerate_pixels() {
-                let x = px as i32 + x_off;
-                let y = py as i32 + y_off;
+                let x = px as i32 + icon_x_off;
+                let y = py as i32 + icon_y_off;
                 if x >= 0 && y >= 0 && x < W as i32 && y < H as i32 {
                     let a = pixel[3] as f32 / 255.0;
                     let bg = img.get_pixel(x as u32, y as u32);
@@ -396,43 +498,37 @@ pub fn get_encoder_lcd_data_uri(
         }
     }
 
-    // --- Separator line ---
-    for y in 5..H - 5 {
-        img.put_pixel(90, y, Rgba([60, 60, 60, 255]));
-    }
-
-    // --- Volume bar (vertical, right side) ---
-    // Bar occupies x=100..190, shows filled portion from bottom
-    let bar_x = 100u32;
-    let bar_w = 80u32;
-    let bar_top = 8u32;
-    let bar_bot = H - 8;
-    let bar_h = bar_bot - bar_top;
+    // --- Vertical volume bar on the right ---
+    const BAR_X: u32 = 88;
+    const BAR_W: u32 = 10;
+    const BAR_TOP: u32 = 4;
+    const BAR_BOT: u32 = 96;
+    let bar_h = BAR_BOT - BAR_TOP;
     let filled_h = (bar_h as f32 * (vol_percent / 100.0).clamp(0.0, 1.0)) as u32;
 
-    // Background of bar
-    for y in bar_top..bar_bot {
-        for x in bar_x..bar_x + bar_w {
+    // Bar track background
+    for y in BAR_TOP..BAR_BOT {
+        for x in BAR_X..BAR_X + BAR_W {
             img.put_pixel(x, y, Rgba([40, 40, 40, 255]));
         }
     }
 
-    // Filled portion (bottom-up)
+    // Filled portion, bottom-up
     let fill_color = if muted {
         Rgba([90, 90, 90, 255])
     } else {
         Rgba([80, 200, 120, 255])
     };
-    let fill_start = bar_bot.saturating_sub(filled_h);
-    for y in fill_start..bar_bot {
-        for x in bar_x..bar_x + bar_w {
+    let fill_start = BAR_BOT.saturating_sub(filled_h);
+    for y in fill_start..BAR_BOT {
+        for x in BAR_X..BAR_X + BAR_W {
             img.put_pixel(x, y, fill_color);
         }
     }
 
-    // Thin highlight line at top of fill
-    if filled_h > 0 && fill_start < bar_bot {
-        for x in bar_x..bar_x + bar_w {
+    // Highlight at top of fill
+    if filled_h > 0 && fill_start < BAR_BOT {
+        for x in BAR_X..BAR_X + BAR_W {
             img.put_pixel(x, fill_start, Rgba([160, 255, 200, 255]));
         }
     }
@@ -448,8 +544,5 @@ pub fn get_encoder_lcd_data_uri(
 
     let mut buf = Vec::new();
     img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)?;
-    Ok(format!(
-        "data:image/png;base64,{}",
-        general_purpose::STANDARD.encode(&buf)
-    ))
+    Ok(format!("data:image/png;base64,{}", general_purpose::STANDARD.encode(&buf)))
 }

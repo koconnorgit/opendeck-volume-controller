@@ -135,19 +135,22 @@ pub async fn update_encoder_dial(channel: &MixerChannel, instance: &Instance) {
     } else {
         &channel.icon_uri
     };
-    match crate::gfx::get_encoder_lcd_data_uri(icon, channel.vol_percent, channel.mute) {
-        Ok(uri) => {
-            let _ = instance.set_image(Some(uri), None).await;
-        }
-        Err(e) => eprintln!("Failed to render encoder LCD image: {e}"),
-    }
-    // Show app name in the OpenDeck UI panel
     let display_name = if channel.is_multi_sink_app {
         channel.sink_name.clone().unwrap_or_else(|| channel.app_name.clone())
     } else {
         channel.app_name.clone()
     };
-    let _ = instance.set_title(Some(display_name), None).await;
+    match crate::gfx::get_encoder_lcd_data_uri(icon, &display_name, channel.vol_percent, channel.mute) {
+        Ok(uri) => {
+            let _ = instance.set_image(Some(uri), None).await;
+        }
+        Err(e) => eprintln!("Failed to render encoder LCD image: {e}"),
+    }
+    // The app name is now rendered into the LCD image itself by gfx.rs, so clear
+    // the action title. OpenDeck's frontend composites the title as an overlay on
+    // top of the image before sending it to the device; leaving a title set would
+    // cause the name to appear twice (once drawn by us, once overlaid).
+    let _ = instance.set_title(Some(""), None).await;
 }
 
 pub async fn cleanup_encoder_dial(instance: &Instance) {
