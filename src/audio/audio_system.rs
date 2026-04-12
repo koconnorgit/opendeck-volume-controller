@@ -6,8 +6,6 @@ pub struct AppInfo {
     pub app_name: String,
     pub icon_search_name: String,
     pub pid: Option<u32>,
-    /// MPRIS media art as raw image bytes (pre-read from cached file).
-    pub mpris_art_data: Option<Vec<u8>>,
     pub sink_name: Option<String>,
     pub mute: bool,
     pub vol_percent: f32,

@@ -420,15 +420,12 @@ pub async fn init() -> OpenActionResult<()> {
     audio::pulse::start_pulse_monitoring();
 
     // create initial map (ignored apps will be loaded via did_receive_global_settings)
-    let mut applications = {
+    let applications = {
         let mut audio_system = create();
         audio_system
             .list_applications()
             .expect("Error fetching applications from SinkController")
     };
-
-    // Enrich with MPRIS media art for browser streams
-    crate::mpris::enrich_with_mpris(&mut applications).await;
 
     let ignored_apps = SHARED_SETTINGS.lock().await.ignored_apps_list.clone();
     mixer::create_mixer_channels(applications, &ignored_apps).await;
