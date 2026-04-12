@@ -429,6 +429,10 @@ pub async fn init() -> OpenActionResult<()> {
 
     let ignored_apps = SHARED_SETTINGS.lock().await.ignored_apps_list.clone();
     mixer::create_mixer_channels(applications, &ignored_apps).await;
+    crate::scroll::sync_scroll_state().await;
+
+    // Start scroll animation timer for long text
+    crate::scroll::start_scroll_timer();
 
     // Register global event handler and action
     set_global_event_handler(&GlobalHandler);

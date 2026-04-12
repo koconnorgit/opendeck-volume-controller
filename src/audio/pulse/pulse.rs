@@ -29,9 +29,10 @@ impl AudioSystem for PulseAudioSystem {
             .iter()
             .map(|app| {
                 app.proplist
-                    .get_str("application.name")
+                    .get_str("media.name")
+                    .or_else(|| app.proplist.get_str("application.name"))
+                    .or(app.name.clone())
                     .unwrap_or("app_stream".to_string())
-                    .to_lowercase()
             })
             .collect();
 
@@ -62,11 +63,12 @@ impl AudioSystem for PulseAudioSystem {
         res.extend(apps.into_iter().map(|app| {
             let app_name = app
                 .proplist
-                .get_str("application.name")
-                .unwrap_or("app_stream".to_string())
-                .to_lowercase();
+                .get_str("media.name")
+                .or_else(|| app.proplist.get_str("application.name"))
+                .or(app.name.clone())
+                .unwrap_or("app_stream".to_string());
 
-            let name_count = app_names.iter().filter(|&name| name == &app_name).count();
+            let name_count = app_names.iter().filter(|name| name.eq_ignore_ascii_case(&app_name)).count();
 
             AppInfo {
                 uid: app.index,

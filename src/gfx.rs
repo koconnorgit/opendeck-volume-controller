@@ -27,7 +27,7 @@ static TITLE_FONT: LazyLock<Option<FontArc>> = LazyLock::new(|| {
     None
 });
 
-fn measure_text_width(font: &FontArc, text: &str, scale: PxScale) -> f32 {
+pub fn measure_text_width(font: &FontArc, text: &str, scale: PxScale) -> f32 {
     let scaled = font.as_scaled(scale);
     let mut width = 0.0f32;
     let mut prev: Option<ab_glyph::GlyphId> = None;
@@ -51,6 +51,11 @@ fn fit_text(font: &FontArc, text: &str, scale: PxScale, max_w: f32) -> String {
         s.pop();
     }
     s
+}
+
+/// Return a reference to the loaded title font, if available.
+pub fn title_font() -> Option<&'static FontArc> {
+    TITLE_FONT.as_ref()
 }
 
 /// Draw text horizontally centered within the rectangle
@@ -102,6 +107,80 @@ fn draw_text_centered(img: &mut RgbaImage, text: &str, area_x: u32, area_y: u32,
         }
         x_cursor += scaled.h_advance(gid);
         prev = Some(gid);
+    }
+}
+
+/// Draw text scrolling horizontally within a clipped region, with seamless wrap-around.
+/// `scroll_offset` is in pixels; the text repeats after `text_width + gap`.
+fn draw_text_scrolling(
+    img: &mut RgbaImage,
+    text: &str,
+    area_x: u32,
+    area_y: u32,
+    area_w: u32,
+    size_px: f32,
+    color: Rgba<u8>,
+    scroll_offset: f32,
+    text_width: f32,
+    gap: f32,
+) {
+    let Some(font) = TITLE_FONT.as_ref() else {
+        return;
+    };
+    if text.is_empty() {
+        return;
+    }
+
+    let scale = PxScale::from(size_px);
+    let scaled = font.as_scaled(scale);
+    let ascent = scaled.ascent();
+    let y_baseline = area_y as f32 + ascent + 1.0;
+    let cycle = text_width + gap;
+
+    // Draw two copies of the text for seamless scrolling
+    for copy in 0..2 {
+        let x_start = area_x as f32 + 2.0 - scroll_offset + copy as f32 * cycle;
+
+        // Skip if this copy is entirely off-screen
+        if x_start > area_x as f32 + area_w as f32 {
+            continue;
+        }
+        if x_start + text_width < area_x as f32 {
+            continue;
+        }
+
+        let mut x_cursor = x_start;
+        let mut prev: Option<ab_glyph::GlyphId> = None;
+        for c in text.chars() {
+            let gid = font.glyph_id(c);
+            if let Some(p) = prev {
+                x_cursor += scaled.kern(p, gid);
+            }
+            let glyph: Glyph = gid.with_scale_and_position(scale, point(x_cursor, y_baseline));
+
+            if let Some(outlined) = font.outline_glyph(glyph) {
+                let bounds = outlined.px_bounds();
+                outlined.draw(|gx, gy, coverage| {
+                    let px = bounds.min.x as i32 + gx as i32;
+                    let py = bounds.min.y as i32 + gy as i32;
+                    // Clip to area_x..area_x+area_w horizontally
+                    if px >= area_x as i32
+                        && (px as u32) < area_x + area_w
+                        && py >= 0
+                        && (py as u32) < img.height()
+                    {
+                        let bg = *img.get_pixel(px as u32, py as u32);
+                        let a = coverage * (color[3] as f32 / 255.0);
+                        let r = (color[0] as f32 * a + bg[0] as f32 * (1.0 - a)) as u8;
+                        let g = (color[1] as f32 * a + bg[1] as f32 * (1.0 - a)) as u8;
+                        let b = (color[2] as f32 * a + bg[2] as f32 * (1.0 - a)) as u8;
+                        img.put_pixel(px as u32, py as u32, Rgba([r, g, b, bg[3]]));
+                    }
+                });
+            }
+            x_cursor += scaled.h_advance(gid);
+            prev = Some(gid);
+        }
     }
 }
 
@@ -458,7 +537,7 @@ fn get_volume_bar_base64_split(volume_percent: f32) -> Result<(String, String)> 
 ///   - Icon: 64x64 resized from source, centered in the (x=0..88, y=30..94) main area
 ///   - Volume bar: x=88..98 (10px wide), y=4..96 (92px tall), filled bottom-up
 ///   - If muted: entire image dimmed to ~35% brightness
-pub fn get_encoder_lcd_data_uri(icon_data_uri: &str, title: &str, vol_percent: f32, muted: bool) -> Result<String> {
+pub fn get_encoder_lcd_data_uri(icon_data_uri: &str, title: &str, vol_percent: f32, muted: bool, scroll_offset: f32) -> Result<String> {
     const W: u32 = 100;
     const H: u32 = 100;
     const TEXT_H: u32 = 28;
@@ -467,7 +546,13 @@ pub fn get_encoder_lcd_data_uri(icon_data_uri: &str, title: &str, vol_percent: f
     let mut img = RgbaImage::from_pixel(W, H, Rgba([18, 18, 18, 255]));
 
     // --- Title text at top ---
-    draw_text_centered(&mut img, title, 0, 0, CONTENT_W, 22.0, Rgba([220, 220, 220, 255]));
+    if scroll_offset > 0.0 {
+        let font = TITLE_FONT.as_ref();
+        let text_width = font.map(|f| measure_text_width(f, title, PxScale::from(22.0))).unwrap_or(0.0);
+        draw_text_scrolling(&mut img, title, 0, 0, CONTENT_W, 22.0, Rgba([220, 220, 220, 255]), scroll_offset, text_width, 30.0);
+    } else {
+        draw_text_centered(&mut img, title, 0, 0, CONTENT_W, 22.0, Rgba([220, 220, 220, 255]));
+    }
 
     // --- App icon, centered in the main content area below the title ---
     const ICON_SIZE: u32 = 64;

@@ -4,6 +4,7 @@ mod audio;
 mod gfx;
 mod mixer;
 mod plugin;
+mod scroll;
 mod utils;
 
 #[tokio::main]
