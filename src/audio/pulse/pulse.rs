@@ -50,7 +50,8 @@ impl AudioSystem for PulseAudioSystem {
 
             res.push(AppInfo {
                 uid: default_sink.index,
-                app_name: system_name,
+                app_name: system_name.clone(),
+                icon_search_name: system_name,
                 sink_name: Some("System Audio".to_string()),
                 mute: default_sink.mute,
                 vol_percent: get_pulse_app_volume_percentage(&default_sink.volume),
@@ -68,11 +69,20 @@ impl AudioSystem for PulseAudioSystem {
                 .or(app.name.clone())
                 .unwrap_or("app_stream".to_string());
 
+            let icon_search_name = app
+                .proplist
+                .get_str("application.name")
+                .or_else(|| app.proplist.get_str("application.process.binary"))
+                .or(app.name.clone())
+                .unwrap_or("app_stream".to_string())
+                .to_lowercase();
+
             let name_count = app_names.iter().filter(|name| name.eq_ignore_ascii_case(&app_name)).count();
 
             AppInfo {
                 uid: app.index,
                 app_name,
+                icon_search_name,
                 sink_name: app.name,
                 mute: app.mute,
                 vol_percent: get_pulse_app_volume_percentage(&app.volume),

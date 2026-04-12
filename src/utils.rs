@@ -216,7 +216,7 @@ pub fn get_app_icon_uri(
             .unwrap_or_else(|| PathBuf::from("img/wave-sound.png"))
     } else {
         fetcher
-            .get_icon_path(fallback_icon_name)
+            .get_icon_path(fallback_icon_name.clone())
             .unwrap_or_else(|| {
                 // Use default
                 uses_default_icon = true;

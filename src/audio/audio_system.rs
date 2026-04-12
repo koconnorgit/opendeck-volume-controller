@@ -4,6 +4,7 @@ use std::error::Error;
 pub struct AppInfo {
     pub uid: u32,
     pub app_name: String,
+    pub icon_search_name: String,
     pub sink_name: Option<String>,
     pub mute: bool,
     pub vol_percent: f32,
