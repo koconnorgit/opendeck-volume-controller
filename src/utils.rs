@@ -202,9 +202,35 @@ pub async fn update_header(instance: &Instance, channel: &MixerChannel) {
 pub fn get_app_icon_uri(
     icon_name: Option<String>,
     fallback_icon_name: String,
+    mpris_art_data: Option<&[u8]>,
 ) -> (String, String, bool) {
     use base64::{Engine as _, engine::general_purpose};
     use std::path::PathBuf;
+
+    // Prefer MPRIS media art if available (pre-read bytes)
+    if let Some(image_data) = mpris_art_data {
+        let base64_normal = general_purpose::STANDARD.encode(image_data);
+        let normal_uri = format!("data:image/png;base64,{}", base64_normal);
+
+        let muted_uri = if let Ok(img) = image::load_from_memory(image_data) {
+            let gray_img = image::DynamicImage::ImageLuma8(img.to_luma8());
+            let mut buffer = std::io::Cursor::new(Vec::new());
+            if gray_img
+                .write_to(&mut buffer, image::ImageFormat::Png)
+                .is_ok()
+            {
+                let gray_data = buffer.into_inner();
+                let base64_gray = general_purpose::STANDARD.encode(&gray_data);
+                format!("data:image/png;base64,{}", base64_gray)
+            } else {
+                normal_uri.clone()
+            }
+        } else {
+            normal_uri.clone()
+        };
+
+        return (normal_uri, muted_uri, false);
+    }
 
     let fetcher = IconFetcher::new();
     let mut uses_default_icon = false;

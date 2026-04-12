@@ -17,6 +17,8 @@ pub struct MixerChannel {
     pub icon_uri: String,
     pub icon_uri_mute: String,
     pub uses_default_icon: bool,
+    /// Cached MPRIS art image bytes — survives file deletion by Firefox.
+    pub mpris_art_data: Option<Vec<u8>>,
     pub is_device: bool,
     pub is_multi_sink_app: bool,
 }
@@ -42,7 +44,7 @@ pub async fn create_mixer_channels(
         }
 
         let (icon_uri, icon_uri_mute, uses_default_icon) =
-            get_app_icon_uri(app.icon_name, app.icon_search_name.clone());
+            get_app_icon_uri(app.icon_name, app.icon_search_name.clone(), app.mpris_art_data.as_deref());
 
         channels.insert(
             col_key as u8,
@@ -59,6 +61,7 @@ pub async fn create_mixer_channels(
                 icon_uri,
                 icon_uri_mute,
                 uses_default_icon,
+                mpris_art_data: app.mpris_art_data,
                 is_device: app.is_device,
                 is_multi_sink_app: app.is_multi_sink_app,
             },
@@ -82,23 +85,28 @@ pub async fn update_mixer_channels(
         }
 
         if let Some(channel) = channels.get_mut(&col_key) {
-            // Check if we need to update the channel
             let needs_update = channel.uid != app.uid
                 || channel.app_name != app.app_name
                 || channel.sink_name != app.sink_name
                 || channel.mute != app.mute
                 || (channel.vol_percent - app.vol_percent).abs() > 0.01
                 || channel.is_device != app.is_device
-                || channel.is_multi_sink_app != app.is_multi_sink_app;
+                || channel.is_multi_sink_app != app.is_multi_sink_app
+                || channel.mpris_art_data != app.mpris_art_data;
 
             if needs_update {
-                if channel.uid != app.uid {
+                // Re-fetch icon when MPRIS art changed or uid changed for non-MPRIS apps
+                let icon_changed = channel.mpris_art_data != app.mpris_art_data
+                    || (channel.uid != app.uid && app.mpris_art_data.is_none());
+
+                if icon_changed {
                     let (icon_uri, icon_uri_mute, uses_default_icon) =
-                        get_app_icon_uri(app.icon_name, app.icon_search_name.clone());
+                        get_app_icon_uri(app.icon_name, app.icon_search_name.clone(), app.mpris_art_data.as_deref());
                     channel.icon_uri = icon_uri;
                     channel.icon_uri_mute = icon_uri_mute;
                     channel.uses_default_icon = uses_default_icon;
                 }
+                channel.mpris_art_data = app.mpris_art_data;
 
                 // Update the channel data
                 channel.uid = app.uid;
@@ -112,7 +120,7 @@ pub async fn update_mixer_channels(
         } else {
             // Insert new channel if it doesn't exist
             let (icon_uri, icon_uri_mute, uses_default_icon) =
-                get_app_icon_uri(app.icon_name, app.icon_search_name.clone());
+                get_app_icon_uri(app.icon_name, app.icon_search_name.clone(), app.mpris_art_data.as_deref());
 
             channels.insert(
                 col_key,
@@ -129,6 +137,7 @@ pub async fn update_mixer_channels(
                     icon_uri,
                     icon_uri_mute,
                     uses_default_icon,
+                    mpris_art_data: app.mpris_art_data,
                     is_device: app.is_device,
                     is_multi_sink_app: app.is_multi_sink_app,
                 },
