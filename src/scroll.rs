@@ -31,6 +31,14 @@ struct ScrollEntry {
 static SCROLL_STATE: LazyLock<Mutex<HashMap<u8, ScrollEntry>>> =
     LazyLock::new(|| Mutex::const_new(HashMap::new()));
 
+/// Check if a channel's LCD text is actively scrolling.
+pub async fn is_lcd_scrolling(channel_idx: u8) -> bool {
+    let scroll = SCROLL_STATE.lock().await;
+    scroll
+        .get(&channel_idx)
+        .is_some_and(|e| e.needs_scroll_lcd)
+}
+
 /// Synchronize scroll state with current mixer channels.
 /// Call after mixer channels are updated.
 pub async fn sync_scroll_state() {

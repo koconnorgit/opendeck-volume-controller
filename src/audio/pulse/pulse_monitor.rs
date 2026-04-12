@@ -22,11 +22,6 @@ static REFRESH_CHANNEL: LazyLock<(
     (tx, std::sync::Mutex::new(Some(rx)))
 });
 
-/// Send a refresh request to re-query audio applications and update displays.
-pub fn request_refresh() {
-    let _ = REFRESH_CHANNEL.0.send(());
-}
-
 pub fn start_pulse_monitoring() {
     if MONITOR_STARTED.load(Ordering::Acquire) {
         return; // Already started
@@ -157,7 +152,12 @@ fn start_refresh_processor() {
 
                 println!("Processing debounced refresh request...");
                 match refresh_audio_applications().await {
-                    Ok(_) => println!("Audio applications refreshed successfully"),
+                    Ok(_) => {
+                        println!("Audio applications refreshed successfully");
+                        // Schedule a delayed full refresh to catch MPRIS art files
+                        // and PulseAudio metadata that arrive after initial events
+                        crate::mpris::schedule_delayed_refresh();
+                    }
                     Err(e) => eprintln!("Failed to refresh audio applications: {:?}", e),
                 }
             }

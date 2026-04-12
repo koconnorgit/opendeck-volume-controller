@@ -102,7 +102,11 @@ pub async fn update_stream_deck_buttons() {
             };
 
             channel.dial_id = Some(instance.instance_id.clone());
-            update_encoder_dial(channel, &instance).await;
+            // Skip LCD re-render for scrolling channels — the scroll timer handles those.
+            // Re-rendering here would flash a static frame and cause visible flicker.
+            if !crate::scroll::is_lcd_scrolling(channel_index).await {
+                update_encoder_dial(channel, &instance).await;
+            }
         } else {
             let Some(coords) = instance.coordinates else {
                 continue;

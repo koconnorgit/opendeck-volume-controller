@@ -437,9 +437,6 @@ pub async fn init() -> OpenActionResult<()> {
     // Start scroll animation timer for long text
     crate::scroll::start_scroll_timer();
 
-    // Monitor MPRIS D-Bus signals for media art/metadata changes
-    crate::mpris::start_mpris_monitoring();
-
     // Register global event handler and action
     set_global_event_handler(&GlobalHandler);
     register_action(VolumeControllerAction).await;
