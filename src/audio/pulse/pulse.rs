@@ -1,9 +1,52 @@
 use crate::audio::{AppInfo, AudioSystem};
 use libpulse_binding::volume::ChannelVolumes;
 use pulsectl::controllers::{AppControl, DeviceControl, SinkController};
+use pulsectl::controllers::types::ApplicationInfo;
 use std::error::Error;
 
 const PA_VOLUME_NORM: u32 = 98304; // 150% in PulseAudio
+
+const BROWSER_KEYWORDS: &[&str] = &[
+    "firefox", "chrome", "chromium", "brave", "edge", "opera", "vivaldi", "safari",
+];
+
+fn is_browser_node(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    BROWSER_KEYWORDS.iter().any(|b| lower.contains(b))
+}
+
+/// Returns (node_name, is_browser). When node.name is absent we fall through to
+/// the legacy media.name / application.name logic, same as browsers do.
+fn classify_node(app: &ApplicationInfo) -> (Option<String>, bool) {
+    let node_name = app.proplist.get_str("node.name");
+    let is_browser = node_name.as_deref().map(is_browser_node).unwrap_or(true);
+    (node_name, is_browser)
+}
+
+fn get_display_name(app: &ApplicationInfo) -> String {
+    let (node_name, is_browser) = classify_node(app);
+    if !is_browser && let Some(nn) = node_name {
+        return nn;
+    }
+    app.proplist
+        .get_str("media.name")
+        .or_else(|| app.proplist.get_str("application.name"))
+        .or(app.name.clone())
+        .unwrap_or("app_stream".to_string())
+}
+
+fn get_icon_search_name(app: &ApplicationInfo) -> String {
+    let (node_name, is_browser) = classify_node(app);
+    if !is_browser && let Some(nn) = node_name {
+        return nn.to_lowercase();
+    }
+    app.proplist
+        .get_str("application.name")
+        .or_else(|| app.proplist.get_str("application.process.binary"))
+        .or(app.name.clone())
+        .unwrap_or("app_stream".to_string())
+        .to_lowercase()
+}
 
 pub struct PulseAudioSystem {
     controller: SinkController,
@@ -25,16 +68,7 @@ impl AudioSystem for PulseAudioSystem {
         let apps = self.controller.list_applications()?;
 
         // Collect all app names including system mixer if present
-        let mut app_names: Vec<String> = apps
-            .iter()
-            .map(|app| {
-                app.proplist
-                    .get_str("media.name")
-                    .or_else(|| app.proplist.get_str("application.name"))
-                    .or(app.name.clone())
-                    .unwrap_or("app_stream".to_string())
-            })
-            .collect();
+        let mut app_names: Vec<String> = apps.iter().map(get_display_name).collect();
 
         // Add the default system sink (main PC audio) only if the global flag is set
         if crate::utils::should_show_system_mixer()
@@ -63,20 +97,8 @@ impl AudioSystem for PulseAudioSystem {
         }
 
         res.extend(apps.into_iter().map(|app| {
-            let app_name = app
-                .proplist
-                .get_str("media.name")
-                .or_else(|| app.proplist.get_str("application.name"))
-                .or(app.name.clone())
-                .unwrap_or("app_stream".to_string());
-
-            let icon_search_name = app
-                .proplist
-                .get_str("application.name")
-                .or_else(|| app.proplist.get_str("application.process.binary"))
-                .or(app.name.clone())
-                .unwrap_or("app_stream".to_string())
-                .to_lowercase();
+            let app_name = get_display_name(&app);
+            let icon_search_name = get_icon_search_name(&app);
 
             let pid = app.proplist.get_str("application.process.id")
                 .and_then(|s| s.parse::<u32>().ok());
