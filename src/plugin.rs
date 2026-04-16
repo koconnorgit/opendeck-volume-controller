@@ -12,7 +12,21 @@ use crate::{
 use std::{collections::HashMap, sync::LazyLock};
 use tokio::sync::Mutex;
 
-const VOLUME_INCREMENT: f64 = 0.1;
+const DEFAULT_VOLUME_INCREMENT: f64 = 0.1;
+const MIN_VOLUME_INCREMENT: f64 = 0.01;
+const MAX_VOLUME_INCREMENT: f64 = 0.5;
+
+fn default_volume_increment() -> f64 {
+    DEFAULT_VOLUME_INCREMENT
+}
+
+fn clamp_volume_increment(v: f64) -> f64 {
+    if v.is_nan() {
+        DEFAULT_VOLUME_INCREMENT
+    } else {
+        v.clamp(MIN_VOLUME_INCREMENT, MAX_VOLUME_INCREMENT)
+    }
+}
 
 pub static COLUMN_TO_CHANNEL_MAP: LazyLock<Mutex<HashMap<u8, u8>>> =
     LazyLock::new(|| Mutex::const_new(HashMap::new()));
@@ -21,19 +35,47 @@ pub static BUTTON_PRESS_CONTROL: LazyLock<Mutex<ButtonPressControl>> =
     LazyLock::new(|| Mutex::const_new(ButtonPressControl::new()));
 
 pub static SHARED_SETTINGS: LazyLock<Mutex<VolumeControllerSettings>> =
-    LazyLock::new(|| Mutex::const_new(VolumeControllerSettings::default()));
+    LazyLock::new(|| Mutex::const_new(VolumeControllerSettings::new_default()));
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct VolumeControllerSettings {
     pub show_sys_mixer: bool,
     pub ignored_apps_list: Vec<String>,
+    pub volume_increment: f64,
 }
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+impl VolumeControllerSettings {
+    const fn new_default() -> Self {
+        Self {
+            show_sys_mixer: false,
+            ignored_apps_list: Vec::new(),
+            volume_increment: DEFAULT_VOLUME_INCREMENT,
+        }
+    }
+}
+
+impl Default for VolumeControllerSettings {
+    fn default() -> Self {
+        Self::new_default()
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct GlobalPluginSettings {
     pub ignored_apps_list: Vec<String>,
+    #[serde(default = "default_volume_increment")]
+    pub volume_increment: f64,
+}
+
+impl Default for GlobalPluginSettings {
+    fn default() -> Self {
+        Self {
+            ignored_apps_list: Vec::new(),
+            volume_increment: DEFAULT_VOLUME_INCREMENT,
+        }
+    }
 }
 
 pub struct GlobalHandler;
@@ -50,20 +92,32 @@ impl GlobalEventHandler for GlobalHandler {
         let global: GlobalPluginSettings = serde_json::from_value(event.payload.settings)
             .unwrap_or_default();
 
-        println!("did_receive_global_settings: {} ignored apps", global.ignored_apps_list.len());
+        let incoming_increment = clamp_volume_increment(global.volume_increment);
+
+        println!(
+            "did_receive_global_settings: {} ignored apps, volume_increment={}",
+            global.ignored_apps_list.len(),
+            incoming_increment
+        );
 
         let mut shared = SHARED_SETTINGS.lock().await;
-        if shared.ignored_apps_list != global.ignored_apps_list {
+        let ignored_changed = shared.ignored_apps_list != global.ignored_apps_list;
+        let increment_changed = (shared.volume_increment - incoming_increment).abs() > f64::EPSILON;
+
+        if ignored_changed || increment_changed {
             shared.ignored_apps_list = global.ignored_apps_list.clone();
+            shared.volume_increment = incoming_increment;
+            let current = shared.clone();
             drop(shared);
 
-            // Sync ignored_apps_list into all instance settings
-            let current = SHARED_SETTINGS.lock().await.clone();
+            // Sync global-sourced fields into all instance settings
             for inst in visible_instances(VolumeControllerAction::UUID).await {
                 let _ = inst.set_settings(&current).await;
             }
 
-            let _ = refresh_audio_applications().await;
+            if ignored_changed {
+                let _ = refresh_audio_applications().await;
+            }
         }
 
         Ok(())
@@ -269,6 +323,7 @@ impl Action for VolumeControllerAction {
                     // Save ignored apps to global settings
                     let global = GlobalPluginSettings {
                         ignored_apps_list: updated_settings.ignored_apps_list.clone(),
+                        volume_increment: updated_settings.volume_increment,
                     };
                     let _ = set_global_settings(global).await;
 
@@ -323,8 +378,9 @@ impl Action for VolumeControllerAction {
                         return Ok(());
                     }
 
+                    let increment = SHARED_SETTINGS.lock().await.volume_increment;
                     let mut audio_system = audio::create();
-                    if let Err(e) = audio_system.increase_volume(app_uid, VOLUME_INCREMENT, channel.is_device) {
+                    if let Err(e) = audio_system.increase_volume(app_uid, increment, channel.is_device) {
                         println!("Warning: Failed to increase volume for {}: {}", channel.app_name, e);
                     } else {
                         println!(
@@ -335,8 +391,9 @@ impl Action for VolumeControllerAction {
                 }
                 2 => {
                     let app_uid = channel.uid;
+                    let increment = SHARED_SETTINGS.lock().await.volume_increment;
                     let mut audio_system = audio::create();
-                    if let Err(e) = audio_system.decrease_volume(app_uid, VOLUME_INCREMENT, channel.is_device) {
+                    if let Err(e) = audio_system.decrease_volume(app_uid, increment, channel.is_device) {
                         println!("Warning: Failed to decrease volume for {}: {}", channel.app_name, e);
                     } else {
                         println!(
@@ -373,9 +430,9 @@ impl Action for VolumeControllerAction {
 
         let uid = channel.uid;
         let is_device = channel.is_device;
-        let increment = VOLUME_INCREMENT * ticks.abs() as f64;
-
         drop(channels);
+
+        let increment = SHARED_SETTINGS.lock().await.volume_increment * ticks.abs() as f64;
 
         let mut audio = audio::create();
         if ticks > 0 {

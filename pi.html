@@ -34,6 +34,23 @@
                 showSysMixer.checked =
                     inActionInfo.payload.settings.show_sys_mixer ?? false;
 
+                const volumeStepInput = document.getElementById("volume_step");
+                const volumeStepValue = document.getElementById("volume_step_value");
+                const MIN_STEP = 1;
+                const MAX_STEP = 50;
+                const DEFAULT_STEP = 10;
+
+                const fractionToPercent = (v) => {
+                    if (typeof v !== "number" || !isFinite(v)) return DEFAULT_STEP;
+                    return Math.min(MAX_STEP, Math.max(MIN_STEP, Math.round(v * 100)));
+                };
+
+                let volumeStepPercent = fractionToPercent(
+                    inActionInfo.payload.settings.volume_increment,
+                );
+                volumeStepInput.value = volumeStepPercent;
+                volumeStepValue.textContent = volumeStepPercent + "%";
+
                 let ignoredAppsList = [];
 
                 const renderIgnoredApps = () => {
@@ -75,10 +92,26 @@
                         console.log("Updating PI with settings:", data.payload.settings);
                         showSysMixer.checked =
                             data.payload.settings.show_sys_mixer ?? false;
+                        const incoming = fractionToPercent(
+                            data.payload.settings.volume_increment,
+                        );
+                        if (incoming !== volumeStepPercent) {
+                            volumeStepPercent = incoming;
+                            volumeStepInput.value = volumeStepPercent;
+                            volumeStepValue.textContent = volumeStepPercent + "%";
+                        }
                     } else if (data.event == "didReceiveGlobalSettings") {
                         console.log("Updating PI with global settings:", data.payload.settings);
                         ignoredAppsList = data.payload.settings.ignored_apps_list ?? [];
                         renderIgnoredApps();
+                        const incoming = fractionToPercent(
+                            data.payload.settings.volume_increment,
+                        );
+                        if (incoming !== volumeStepPercent) {
+                            volumeStepPercent = incoming;
+                            volumeStepInput.value = volumeStepPercent;
+                            volumeStepValue.textContent = volumeStepPercent + "%";
+                        }
                     }
                 };
 
@@ -89,10 +122,25 @@
                             context: inPropertyInspectorUUID,
                             payload: {
                                 ignored_apps_list: ignoredAppsList,
+                                volume_increment: volumeStepPercent / 100,
                             },
                         }),
                     );
                 };
+
+                volumeStepInput.addEventListener("input", () => {
+                    const raw = parseInt(volumeStepInput.value, 10);
+                    const clamped = Math.min(
+                        MAX_STEP,
+                        Math.max(MIN_STEP, isNaN(raw) ? DEFAULT_STEP : raw),
+                    );
+                    volumeStepPercent = clamped;
+                    volumeStepValue.textContent = clamped + "%";
+                });
+
+                volumeStepInput.addEventListener("change", () => {
+                    updateGlobal();
+                });
 
                 update = () => {
                     websocket.send(
@@ -139,6 +187,23 @@
                 font-weight: bold;
                 margin-bottom: 8px;
                 color: oklch(92.2% 0 0);
+            }
+
+            .step-row {
+                display: flex;
+                align-items: center;
+                gap: 12px;
+            }
+
+            .step-row input[type="range"] {
+                flex: 1;
+                accent-color: oklch(70% 0.15 240);
+            }
+
+            #volume_step_value {
+                min-width: 44px;
+                text-align: right;
+                font-variant-numeric: tabular-nums;
             }
 
             #ignored_apps_list {
@@ -197,6 +262,21 @@
         <div class="section">
             <label for="show_sys_mixer">Show system mixer:</label>
             <input id="show_sys_mixer" type="checkbox" oninput="update();" />
+        </div>
+
+        <div class="section">
+            <div class="section-title">Volume step per encoder click</div>
+            <div class="step-row">
+                <input
+                    id="volume_step"
+                    type="range"
+                    min="1"
+                    max="50"
+                    step="1"
+                    value="10"
+                />
+                <span id="volume_step_value">10%</span>
+            </div>
         </div>
 
         <div class="section">
