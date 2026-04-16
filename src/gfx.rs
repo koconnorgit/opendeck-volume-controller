@@ -655,12 +655,50 @@ pub fn get_encoder_lcd_data_uri(icon_data_uri: &str, title: &str, vol_percent: f
     let pct_str = format!("{}%", vol_percent.round() as i32);
     draw_text_centered(&mut img, &pct_str, TITLE_X, PCT_Y, TITLE_W, PCT_SIZE, title_color);
 
+    // --- Light rounded border around the LCD ---
+    const BORDER_COLOR: Rgba<u8> = Rgba([200, 200, 200, 255]);
+    const BORDER_RADIUS: u32 = 12;
+    const BORDER_THICKNESS: u32 = 2;
+    draw_volume_bar_outline(
+        &mut img,
+        0,
+        0,
+        W,
+        H,
+        BORDER_RADIUS,
+        BORDER_COLOR,
+        BORDER_THICKNESS,
+    );
+
     // --- Mute dim overlay ---
     if muted {
         for pixel in img.pixels_mut() {
             pixel[0] = (pixel[0] as f32 * 0.35) as u8;
             pixel[1] = (pixel[1] as f32 * 0.35) as u8;
             pixel[2] = (pixel[2] as f32 * 0.35) as u8;
+        }
+    }
+
+    // --- Clip everything outside the rounded border to transparent ---
+    for y in 0..H {
+        for x in 0..W {
+            let d = volume_bar_distance(
+                x as f32 + 0.5,
+                y as f32 + 0.5,
+                0.0,
+                0.0,
+                W as f32,
+                H as f32,
+                BORDER_RADIUS as f32,
+            );
+            if d >= 0.5 {
+                img.put_pixel(x, y, Rgba([0, 0, 0, 0]));
+            } else if d > -0.5 {
+                let coverage = (0.5 - d).clamp(0.0, 1.0);
+                let px = img.get_pixel(x, y);
+                let new_a = ((px[3] as f32) * coverage) as u8;
+                img.put_pixel(x, y, Rgba([px[0], px[1], px[2], new_a]));
+            }
         }
     }
 
