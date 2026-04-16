@@ -1,6 +1,6 @@
 # OA Volume Controller Plugin
 
-> **Fork notice:** This is a fork of [mdvictor/opendeck-volume-controller](https://github.com/mdvictor/opendeck-volume-controller) by Victor Marin (MIT licensed). It adds encoder/dial support for Stream Deck + devices and a redesigned 100×100 encoder LCD layout that renders the app name, icon, and a thin right-side volume bar. The original button-grid functionality is unchanged.
+> **Fork notice:** This is a fork of [mdvictor/opendeck-volume-controller](https://github.com/mdvictor/opendeck-volume-controller) by Victor Marin (MIT licensed). It adds encoder/dial support for Stream Deck + devices and a 200×100 encoder LCD layout with a 96×96 app icon on the left and the app name, a horizontal volume bar, and a percent readout on the right. The original button-grid functionality is unchanged.
 
 A per-application volume control plugin for Stream Deck using OpenDeck on Linux.
 
@@ -83,7 +83,7 @@ Assign the action directly to an encoder dial on a Stream Deck + or Stream Deck 
 
 - **Rotate** the dial to adjust volume up or down
 - **Press** the dial to toggle mute
-- The LCD zone shows the app name at the top, the app icon centered, and a vertical volume bar along the right edge; muting dims the whole zone
+- The LCD zone shows the 96×96 app icon on the left, and on the right: the app name on top (scrolls horizontally if long), a horizontal volume bar, and a percent readout below; muting dims the whole zone
 
 ## ToDo (from upstream)
 

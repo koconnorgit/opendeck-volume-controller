@@ -9,8 +9,8 @@ use crate::mixer::MIXER_CHANNELS;
 
 const SCROLL_SPEED_PX: f32 = 1.5;
 const SCROLL_GAP_PX: f32 = 30.0;
-const LCD_FONT_SIZE: f32 = 22.0;
-const LCD_MAX_WIDTH: f32 = 84.0; // CONTENT_W (88) minus 4px padding
+const LCD_FONT_SIZE: f32 = 24.0;
+const LCD_MAX_WIDTH: f32 = 84.0; // TITLE_W (88) minus 4px padding
 
 const HEADER_WINDOW: usize = 8;
 const HEADER_GAP: &str = "   ";

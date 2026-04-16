@@ -530,47 +530,105 @@ fn get_volume_bar_base64_split(volume_percent: f32) -> Result<(String, String)> 
     Ok((top_base64, bottom_base64))
 }
 
-/// Generate a 100x100 encoder LCD image showing the app title, icon, and volume bar.
+/// Draw a rounded-rect horizontal volume bar: track across the full width,
+/// with the leftmost `fill_ratio` portion in `fill_color`.
+fn draw_horizontal_volume_bar(
+    img: &mut RgbaImage,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    radius: u32,
+    track_color: Rgba<u8>,
+    fill_color: Rgba<u8>,
+    fill_ratio: f32,
+) {
+    let x_f = x as f32;
+    let y_f = y as f32;
+    let w_f = w as f32;
+    let h_f = h as f32;
+    let r = radius as f32;
+    let fill_x_max = x_f + w_f * fill_ratio.clamp(0.0, 1.0);
+
+    let min_x = x.saturating_sub(1);
+    let max_x = (x + w + 1).min(img.width());
+    let min_y = y.saturating_sub(1);
+    let max_y = (y + h + 1).min(img.height());
+
+    for py in min_y..max_y {
+        for px in min_x..max_x {
+            let px_f = px as f32 + 0.5;
+            let py_f = py as f32 + 0.5;
+            let d = volume_bar_distance(px_f, py_f, x_f, y_f, w_f, h_f, r);
+            if d > 0.5 {
+                continue;
+            }
+            let coverage = (0.5 - d).clamp(0.0, 1.0);
+            let color = if px_f < fill_x_max { fill_color } else { track_color };
+            let bg = *img.get_pixel(px, py);
+            img.put_pixel(px, py, blend_colors(bg, color, coverage));
+        }
+    }
+}
+
+/// Generate a 200x100 encoder LCD image: icon on the left, title + horizontal
+/// volume bar + percent readout on the right.
 ///
 /// Layout (native canvas, top-left origin):
-///   - Title strip: y=0..28, x=0..88, Noto Sans Bold ~22px, centered, truncated to fit
-///   - Icon: 64x64 resized from source, centered in the (x=0..88, y=30..94) main area
-///   - Volume bar: x=88..98 (10px wide), y=4..96 (92px tall), filled bottom-up
-///   - If muted: entire image dimmed to ~35% brightness
+///   - Icon: 96x96, x=2..98, y=2..98
+///   - Right column: x=102..198 (96px wide)
+///       - Title strip: y=4..34, 24px Noto Sans Bold, centered, scrolls if overflowing
+///       - Horizontal volume bar: x=108..192, y=44..64, rounded
+///       - Percent readout ("NN%"): y=68..96, 24px, centered
+///   - If muted: bar uses grey fill and the entire image is dimmed to ~35%.
 pub fn get_encoder_lcd_data_uri(icon_data_uri: &str, title: &str, vol_percent: f32, muted: bool, scroll_offset: f32) -> Result<String> {
-    const W: u32 = 100;
+    const W: u32 = 200;
     const H: u32 = 100;
-    const TEXT_H: u32 = 28;
-    const CONTENT_W: u32 = 88; // leave 12px on the right for the volume bar
+
+    const ICON_SIZE: u32 = 96;
+    const ICON_X_OFF: i32 = 2;
+    const ICON_Y_OFF: i32 = 2;
+
+    const RIGHT_X: u32 = 102;
+    const RIGHT_W: u32 = 96;
+    const TITLE_PAD: u32 = 4;
+    const TITLE_X: u32 = RIGHT_X + TITLE_PAD; // 106
+    const TITLE_W: u32 = RIGHT_W - TITLE_PAD * 2; // 88
+    const TITLE_Y: u32 = 4;
+    const TITLE_SIZE: f32 = 24.0;
+
+    const BAR_X: u32 = RIGHT_X + 6; // 108
+    const BAR_W: u32 = RIGHT_W - 12; // 84
+    const BAR_Y: u32 = 44;
+    const BAR_H: u32 = 20;
+    const BAR_RADIUS: u32 = 10;
+
+    const PCT_Y: u32 = 68;
+    const PCT_SIZE: f32 = 24.0;
 
     let mut img = RgbaImage::from_pixel(W, H, Rgba([18, 18, 18, 255]));
 
-    // --- Title text at top ---
+    // --- Title (top of right column, scrolling if needed) ---
+    let title_color = Rgba([220, 220, 220, 255]);
     if scroll_offset > 0.0 {
         let font = TITLE_FONT.as_ref();
-        let text_width = font.map(|f| measure_text_width(f, title, PxScale::from(22.0))).unwrap_or(0.0);
-        draw_text_scrolling(&mut img, title, 0, 0, CONTENT_W, 22.0, Rgba([220, 220, 220, 255]), scroll_offset, text_width, 30.0);
+        let text_width = font
+            .map(|f| measure_text_width(f, title, PxScale::from(TITLE_SIZE)))
+            .unwrap_or(0.0);
+        draw_text_scrolling(&mut img, title, TITLE_X, TITLE_Y, TITLE_W, TITLE_SIZE, title_color, scroll_offset, text_width, 30.0);
     } else {
-        draw_text_centered(&mut img, title, 0, 0, CONTENT_W, 22.0, Rgba([220, 220, 220, 255]));
+        draw_text_centered(&mut img, title, TITLE_X, TITLE_Y, TITLE_W, TITLE_SIZE, title_color);
     }
 
-    // --- App icon, centered in the main content area below the title ---
-    const ICON_SIZE: u32 = 64;
-    let icon_area_x = 0u32;
-    let icon_area_y = TEXT_H + 2; // 2px gap under title
-    let icon_area_w = CONTENT_W;
-    let icon_area_h = H - icon_area_y - 4; // 4px bottom padding
-    let icon_x_off = icon_area_x as i32 + ((icon_area_w as i32) - (ICON_SIZE as i32)) / 2;
-    let icon_y_off = icon_area_y as i32 + ((icon_area_h as i32) - (ICON_SIZE as i32)) / 2;
-
+    // --- App icon, left side ---
     let icon_bytes_b64 = icon_data_uri.split_once(',').map(|(_, b)| b).unwrap_or("");
     if let Ok(icon_bytes) = base64::engine::general_purpose::STANDARD.decode(icon_bytes_b64) {
         if let Ok(icon_img) = image::load_from_memory(&icon_bytes) {
             let icon = icon_img.resize(ICON_SIZE, ICON_SIZE, image::imageops::FilterType::Lanczos3);
             let icon_rgba = icon.to_rgba8();
             for (px, py, pixel) in icon_rgba.enumerate_pixels() {
-                let x = px as i32 + icon_x_off;
-                let y = py as i32 + icon_y_off;
+                let x = px as i32 + ICON_X_OFF;
+                let y = py as i32 + ICON_Y_OFF;
                 if x >= 0 && y >= 0 && x < W as i32 && y < H as i32 {
                     let a = pixel[3] as f32 / 255.0;
                     let bg = img.get_pixel(x as u32, y as u32);
@@ -583,40 +641,19 @@ pub fn get_encoder_lcd_data_uri(icon_data_uri: &str, title: &str, vol_percent: f
         }
     }
 
-    // --- Vertical volume bar on the right ---
-    const BAR_X: u32 = 88;
-    const BAR_W: u32 = 10;
-    const BAR_TOP: u32 = 4;
-    const BAR_BOT: u32 = 96;
-    let bar_h = BAR_BOT - BAR_TOP;
-    let filled_h = (bar_h as f32 * (vol_percent / 100.0).clamp(0.0, 1.0)) as u32;
-
-    // Bar track background
-    for y in BAR_TOP..BAR_BOT {
-        for x in BAR_X..BAR_X + BAR_W {
-            img.put_pixel(x, y, Rgba([40, 40, 40, 255]));
-        }
-    }
-
-    // Filled portion, bottom-up
+    // --- Horizontal volume bar ---
+    let track_color = Rgba([40, 40, 40, 255]);
     let fill_color = if muted {
         Rgba([90, 90, 90, 255])
     } else {
         Rgba([80, 200, 120, 255])
     };
-    let fill_start = BAR_BOT.saturating_sub(filled_h);
-    for y in fill_start..BAR_BOT {
-        for x in BAR_X..BAR_X + BAR_W {
-            img.put_pixel(x, y, fill_color);
-        }
-    }
+    let fill_ratio = (vol_percent / 100.0).clamp(0.0, 1.0);
+    draw_horizontal_volume_bar(&mut img, BAR_X, BAR_Y, BAR_W, BAR_H, BAR_RADIUS, track_color, fill_color, fill_ratio);
 
-    // Highlight at top of fill
-    if filled_h > 0 && fill_start < BAR_BOT {
-        for x in BAR_X..BAR_X + BAR_W {
-            img.put_pixel(x, fill_start, Rgba([160, 255, 200, 255]));
-        }
-    }
+    // --- Percent readout ---
+    let pct_str = format!("{}%", vol_percent.round() as i32);
+    draw_text_centered(&mut img, &pct_str, TITLE_X, PCT_Y, TITLE_W, PCT_SIZE, title_color);
 
     // --- Mute dim overlay ---
     if muted {
