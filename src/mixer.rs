@@ -126,9 +126,32 @@ pub async fn update_mixer_channels(
 
     for app in active_apps {
         let channel = if let Some(mut prev) = previous_by_uid.remove(&app.uid) {
-            // Existing stream: never replace the icon once we have one.
-            // Only try to claim MPRIS art if this slot has never had any.
-            if prev.mpris_art_path.is_none() {
+            // Detect a media.name shift on the same sink-input (e.g. FFZ's
+            // long-lived AudioContext keeps the same uid across Twitch
+            // navigations). When this happens, unlock the slot, drop stale
+            // art, and reset to a default icon. Re-claim is deferred to the
+            // delayed refresh — the new MPRIS art file may not be written
+            // yet at this exact moment.
+            let name_shifted = !crate::mpris::is_generic_name(&app.app_name)
+                && app.app_name != prev.app_name;
+
+            if name_shifted {
+                prev.locked = false;
+                prev.app_name = app.app_name.clone();
+                if let Some(old_path) = prev.mpris_art_path.take() {
+                    claimed_paths.remove(&old_path);
+                }
+                prev.mpris_art_data = None;
+                let (icon_uri, icon_uri_mute, uses_default_icon) = get_app_icon_uri(
+                    app.icon_name.clone(),
+                    app.icon_search_name.clone(),
+                    None,
+                );
+                prev.icon_uri = icon_uri;
+                prev.icon_uri_mute = icon_uri_mute;
+                prev.uses_default_icon = uses_default_icon;
+            } else if prev.mpris_art_path.is_none() {
+                // Existing stream that has never had art: try to claim some now.
                 if let Some(pid) = app.pid {
                     if let Some((path, bytes)) = crate::mpris::claim_art(pid, &claimed_paths) {
                         claimed_paths.insert(path.clone());
