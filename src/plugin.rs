@@ -477,12 +477,15 @@ pub async fn init() -> OpenActionResult<()> {
     audio::pulse::start_pulse_monitoring();
 
     // create initial map (ignored apps will be loaded via did_receive_global_settings)
-    let applications = {
+    let mut applications = {
         let mut audio_system = create();
         audio_system
             .list_applications()
             .expect("Error fetching applications from SinkController")
     };
+
+    // Recover real names for streams whose media.name is generic (e.g. Kick.com).
+    crate::mpris::enrich_generic_names(&mut applications).await;
 
     let ignored_apps = SHARED_SETTINGS.lock().await.ignored_apps_list.clone();
     mixer::create_mixer_channels(applications, &ignored_apps).await;

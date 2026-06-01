@@ -167,12 +167,15 @@ fn start_refresh_processor() {
 
 pub async fn refresh_audio_applications() -> Result<(), Box<dyn std::error::Error>> {
     // Get current applications (same logic as manual-detection)
-    let applications = {
+    let mut applications = {
         let mut audio_system = audio::create();
         audio_system
             .list_applications()
             .map_err(|e| format!("Error fetching applications: {:?}", e))?
     };
+
+    // Recover real names for streams whose media.name is generic (e.g. Kick.com).
+    crate::mpris::enrich_generic_names(&mut applications).await;
 
     // Get ignored apps list from shared settings
     let ignored_apps = {
