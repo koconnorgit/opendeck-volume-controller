@@ -7,6 +7,7 @@ mod mpris;
 mod plugin;
 mod scroll;
 mod utils;
+mod window_icons;
 
 #[tokio::main]
 async fn main() -> OpenActionResult<()> {

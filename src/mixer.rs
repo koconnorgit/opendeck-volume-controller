@@ -72,7 +72,7 @@ fn apply_art(
 ) {
     claimed_paths.insert(path.clone());
     let (icon_uri, icon_uri_mute, uses_default_icon) =
-        get_app_icon_uri(icon_name, icon_search_name, Some(&bytes));
+        get_app_icon_uri(icon_name, icon_search_name, Some(&bytes), None, None);
     channel.icon_uri = icon_uri;
     channel.icon_uri_mute = icon_uri_mute;
     channel.uses_default_icon = uses_default_icon;
@@ -156,8 +156,13 @@ pub async fn create_mixer_channels(applications: Vec<AppInfo>, ignored_apps: &[S
 
     let mut col_key: u8 = 0;
     for app in active.into_iter() {
-        let (icon_uri, icon_uri_mute, uses_default_icon) =
-            get_app_icon_uri(app.icon_name.clone(), app.icon_search_name.clone(), None);
+        let (icon_uri, icon_uri_mute, uses_default_icon) = get_app_icon_uri(
+            app.icon_name.clone(),
+            app.icon_search_name.clone(),
+            None,
+            app.wm_class.as_deref(),
+            app.window_icon.as_ref(),
+        );
 
         let mut channel = MixerChannel {
             header_id: None,
@@ -260,6 +265,8 @@ pub async fn update_mixer_channels(
                     app.icon_name.clone(),
                     app.icon_search_name.clone(),
                     None,
+                    app.wm_class.as_deref(),
+                    app.window_icon.as_ref(),
                 );
                 prev.icon_uri = icon_uri;
                 prev.icon_uri_mute = icon_uri_mute;
@@ -334,8 +341,13 @@ pub async fn update_mixer_channels(
             let has_good_name = !crate::mpris::is_generic_name(&display_name);
             let locked = has_good_name && art_resolved;
 
-            let (icon_uri, icon_uri_mute, uses_default_icon) =
-                get_app_icon_uri(app.icon_name, app.icon_search_name.clone(), None);
+            let (icon_uri, icon_uri_mute, uses_default_icon) = get_app_icon_uri(
+                app.icon_name.clone(),
+                app.icon_search_name.clone(),
+                None,
+                app.wm_class.as_deref(),
+                app.window_icon.as_ref(),
+            );
 
             MixerChannel {
                 header_id: None,

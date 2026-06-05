@@ -21,3 +21,4 @@ tux-icons = "0.4.4"
 ab_glyph = "0.2"
 zbus = { version = "5", features = ["tokio"] }
 futures-lite = "2.6.1"
+x11rb = "0.13"

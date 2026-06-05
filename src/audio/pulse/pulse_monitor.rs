@@ -177,6 +177,9 @@ pub async fn refresh_audio_applications() -> Result<(), Box<dyn std::error::Erro
     // Recover real names for streams whose media.name is generic (e.g. Kick.com).
     crate::mpris::enrich_generic_names(&mut applications).await;
 
+    // Attach real app icons from XWayland windows where available.
+    crate::window_icons::enrich(&mut applications);
+
     // Get ignored apps list from shared settings
     let ignored_apps = {
         let settings = crate::plugin::SHARED_SETTINGS.lock().await;

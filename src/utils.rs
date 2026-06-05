@@ -199,69 +199,92 @@ pub async fn update_header(instance: &Instance, channel: &MixerChannel) {
     }
 }
 
-/// Get application icon as base64 data URIs
-/// If icon_name is None, returns the default wave-sound.png icon
-/// Otherwise, attempts to find and encode the system icon for the given icon name
-/// Returns (normal_icon_uri, muted_icon_uri, uses_default_icon)
+/// Minimum largest-dimension for a window's `_NET_WM_ICON` to be preferred over
+/// a themed icon. Above this we trust the real window pixels (e.g. Steam's 128px
+/// icon beats its monochrome tray theme icon); below it we prefer the (usually
+/// higher-res) themed icon and keep the small window icon only as a fallback.
+const HIGH_RES_WINDOW_ICON: u32 = 64;
+
+/// Resolve the best icon source for a stream as `(bytes, mime, uses_default)`.
+///
+/// Precedence: MPRIS media art → high-res window icon → themed icon (by the best
+/// available keys) → any window icon → bundled default. The themed-icon lookup
+/// is only performed when the earlier, cheaper sources don't apply.
+fn resolve_icon_source(
+    icon_name: Option<String>,
+    fallback_icon_name: String,
+    mpris_art_data: Option<&[u8]>,
+    wm_class: Option<&str>,
+    window_icon: Option<&crate::window_icons::WindowIcon>,
+) -> (Vec<u8>, String, bool) {
+    // 1. MPRIS media art (browsers).
+    if let Some(data) = mpris_art_data {
+        return (data.to_vec(), "image/png".to_string(), false);
+    }
+
+    // 2. A high-res real window icon beats a possibly-poor themed icon.
+    if let Some(wi) = window_icon {
+        if wi.max_dim >= HIGH_RES_WINDOW_ICON {
+            return (wi.png.clone(), "image/png".to_string(), false);
+        }
+    }
+
+    // 3. Themed icon, trying the cleanest keys first.
+    let mut keys: Vec<String> = Vec::new();
+    if let Some(name) = icon_name {
+        keys.push(name);
+    }
+    if let Some(wc) = wm_class {
+        keys.push(wc.to_string());
+        // Themed files often use a hyphenated/condensed form of a spaced app-id.
+        if wc.contains(' ') {
+            keys.push(wc.replace(' ', "-"));
+            keys.push(wc.replace(' ', ""));
+        }
+    }
+    keys.push(fallback_icon_name);
+
+    let fetcher = IconFetcher::new();
+    if let Some(path) = keys.iter().find_map(|k| fetcher.get_icon_path(k.clone())) {
+        if let Ok(bytes) = std::fs::read(&path) {
+            let mime = match path.extension().and_then(|e| e.to_str()) {
+                Some("svg") => "image/svg+xml",
+                Some("xpm") => "image/x-xpm",
+                _ => "image/png",
+            };
+            return (bytes, mime.to_string(), false);
+        }
+    }
+
+    // 4. Any window icon (small) before falling back to the generic default.
+    if let Some(wi) = window_icon {
+        return (wi.png.clone(), "image/png".to_string(), false);
+    }
+
+    // 5. Bundled default.
+    let bytes = std::fs::read("img/wave-sound.png").unwrap_or_default();
+    (bytes, "image/png".to_string(), true)
+}
+
+/// Get application icon as base64 data URIs.
+/// Resolves the best available source (MPRIS art, window icon, themed icon, or
+/// the bundled default) and returns (normal_uri, muted_uri, uses_default_icon).
 pub fn get_app_icon_uri(
     icon_name: Option<String>,
     fallback_icon_name: String,
     mpris_art_data: Option<&[u8]>,
+    wm_class: Option<&str>,
+    window_icon: Option<&crate::window_icons::WindowIcon>,
 ) -> (String, String, bool) {
     use base64::{Engine as _, engine::general_purpose};
-    use std::path::PathBuf;
 
-    // Prefer MPRIS media art if available (pre-read bytes)
-    if let Some(image_data) = mpris_art_data {
-        let base64_normal = general_purpose::STANDARD.encode(image_data);
-        let normal_uri = format!("data:image/png;base64,{}", base64_normal);
-
-        let muted_uri = if let Ok(img) = image::load_from_memory(image_data) {
-            let gray_img = image::DynamicImage::ImageLuma8(img.to_luma8());
-            let mut buffer = std::io::Cursor::new(Vec::new());
-            if gray_img
-                .write_to(&mut buffer, image::ImageFormat::Png)
-                .is_ok()
-            {
-                let gray_data = buffer.into_inner();
-                let base64_gray = general_purpose::STANDARD.encode(&gray_data);
-                format!("data:image/png;base64,{}", base64_gray)
-            } else {
-                normal_uri.clone()
-            }
-        } else {
-            normal_uri.clone()
-        };
-
-        return (normal_uri, muted_uri, false);
-    }
-
-    let fetcher = IconFetcher::new();
-    let mut uses_default_icon = false;
-
-    let icon_path = if let Some(name) = icon_name {
-        fetcher
-            .get_icon_path(name)
-            .or_else(|| fetcher.get_icon_path(fallback_icon_name.clone()))
-            .unwrap_or_else(|| PathBuf::from("img/wave-sound.png"))
-    } else {
-        fetcher
-            .get_icon_path(fallback_icon_name.clone())
-            .unwrap_or_else(|| {
-                // Use default
-                uses_default_icon = true;
-                PathBuf::from("img/wave-sound.png")
-            })
-    };
-
-    let image_data = std::fs::read(&icon_path).expect("Failed to read icon file");
-
-    let mime_type = match icon_path.extension().and_then(|e| e.to_str()) {
-        Some("png") => "image/png",
-        Some("svg") => "image/svg+xml",
-        Some("xpm") => "image/x-xpm",
-        _ => "image/png",
-    };
+    let (image_data, mime_type, uses_default_icon) = resolve_icon_source(
+        icon_name,
+        fallback_icon_name,
+        mpris_art_data,
+        wm_class,
+        window_icon,
+    );
 
     let base64_normal = general_purpose::STANDARD.encode(&image_data);
     let normal_uri = format!("data:{};base64,{}", mime_type, base64_normal);

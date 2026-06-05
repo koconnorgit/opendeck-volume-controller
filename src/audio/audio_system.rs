@@ -12,6 +12,18 @@ pub struct AppInfo {
     pub icon_name: Option<String>,
     pub is_device: bool,
     pub is_multi_sink_app: bool,
+    /// PID from the owning PulseAudio *client* proplist. For some apps (e.g.
+    /// pipewire-native ones) the sink-input has no PID but the client does.
+    pub client_pid: Option<u32>,
+    /// `application.name` from the client proplist.
+    pub client_name: Option<String>,
+    /// `application.process.binary` from the client proplist — a clean icon key.
+    pub client_binary: Option<String>,
+    /// Normalized app-id of the matched XWayland window (lowercased, `.exe`
+    /// stripped), used as a high-quality themed-icon lookup key.
+    pub wm_class: Option<String>,
+    /// Real icon pixels pulled from the matched window's `_NET_WM_ICON`.
+    pub window_icon: Option<crate::window_icons::WindowIcon>,
 }
 
 pub trait AudioSystem {

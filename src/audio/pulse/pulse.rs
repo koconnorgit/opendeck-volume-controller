@@ -1,8 +1,22 @@
 use crate::audio::{AppInfo, AudioSystem};
+use libpulse_binding::callbacks::ListResult;
 use libpulse_binding::volume::ChannelVolumes;
 use pulsectl::controllers::{AppControl, DeviceControl, SinkController};
 use pulsectl::controllers::types::ApplicationInfo;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::error::Error;
+use std::rc::Rc;
+
+/// Identity recovered from a PulseAudio *client* proplist. Some apps (notably
+/// pipewire-native ones) leave the sink-input proplist sparse and only populate
+/// these on the owning client.
+#[derive(Default, Clone)]
+struct ClientProps {
+    name: Option<String>,
+    binary: Option<String>,
+    pid: Option<u32>,
+}
 
 const PA_VOLUME_NORM: u32 = 98304; // 150% in PulseAudio
 
@@ -58,6 +72,41 @@ impl PulseAudioSystem {
             controller: SinkController::create()?,
         })
     }
+
+    /// Snapshot every PulseAudio client's identity, keyed by client index.
+    /// Drives the controller's mainloop synchronously, mirroring how pulsectl's
+    /// own list calls work. Returns an empty map on any failure.
+    fn client_proplist_map(&mut self) -> HashMap<u32, ClientProps> {
+        let map = Rc::new(RefCell::new(HashMap::new()));
+        let map_ref = map.clone();
+
+        let op = self
+            .controller
+            .handler
+            .introspect
+            .get_client_info_list(move |result| {
+                if let ListResult::Item(item) = result {
+                    let pl = &item.proplist;
+                    map_ref.borrow_mut().insert(
+                        item.index,
+                        ClientProps {
+                            name: pl.get_str("application.name"),
+                            binary: pl.get_str("application.process.binary"),
+                            pid: pl
+                                .get_str("application.process.id")
+                                .and_then(|s| s.parse::<u32>().ok()),
+                        },
+                    );
+                }
+            });
+
+        if self.controller.handler.wait_for_operation(op).is_err() {
+            return HashMap::new();
+        }
+        Rc::try_unwrap(map)
+            .map(|cell| cell.into_inner())
+            .unwrap_or_default()
+    }
 }
 
 impl AudioSystem for PulseAudioSystem {
@@ -66,6 +115,10 @@ impl AudioSystem for PulseAudioSystem {
 
         // Add individual applications first to collect all app names
         let apps = self.controller.list_applications()?;
+
+        // Recover per-client identity (name/binary/pid) for streams whose
+        // sink-input proplist is sparse (e.g. pipewire-native apps).
+        let client_map = self.client_proplist_map();
 
         // Collect all app names including system mixer if present
         let mut app_names: Vec<String> = apps.iter().map(get_display_name).collect();
@@ -93,6 +146,11 @@ impl AudioSystem for PulseAudioSystem {
                 icon_name: Some("audio-card".to_string()),
                 is_device: true,
                 is_multi_sink_app: false,
+                client_pid: None,
+                client_name: None,
+                client_binary: None,
+                wm_class: None,
+                window_icon: None,
             });
         }
 
@@ -105,6 +163,8 @@ impl AudioSystem for PulseAudioSystem {
 
             let name_count = app_names.iter().filter(|name| name.eq_ignore_ascii_case(&app_name)).count();
 
+            let client = app.client.and_then(|c| client_map.get(&c));
+
             AppInfo {
                 uid: app.index,
                 app_name,
@@ -116,6 +176,11 @@ impl AudioSystem for PulseAudioSystem {
                 icon_name: app.proplist.get_str("application.icon_name"),
                 is_device: false,
                 is_multi_sink_app: name_count > 1,
+                client_pid: client.and_then(|c| c.pid),
+                client_name: client.and_then(|c| c.name.clone()),
+                client_binary: client.and_then(|c| c.binary.clone()),
+                wm_class: None,
+                window_icon: None,
             }
         }));
 
