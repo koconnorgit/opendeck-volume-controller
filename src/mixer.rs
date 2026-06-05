@@ -1,7 +1,9 @@
+use crate::audio::audio_system::AppInfo;
 use crate::utils::get_app_icon_uri;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::LazyLock;
+use std::time::SystemTime;
 use tokio::sync::Mutex;
 
 #[derive(Clone, Debug)]
@@ -27,6 +29,14 @@ pub struct MixerChannel {
     /// Once true, name and icon are locked and won't be overwritten by refreshes.
     /// Only volume, mute, and other live data update. Reset when stream stops.
     pub locked: bool,
+    /// Wall-clock time this sink-input was first observed appearing, used to
+    /// correlate art files to the stream by timing. `None` means the stream was
+    /// already playing at cold start (true start unknown → best-effort claim).
+    pub first_seen: Option<std::time::SystemTime>,
+    /// Once true, the art-claim decision is final and never re-attempted —
+    /// whether it produced art or a deliberate "no art". Stops a later refresh
+    /// from grabbing an unrelated file. Reset only on a name-shift.
+    pub art_resolved: bool,
     pub is_device: bool,
     pub is_multi_sink_app: bool,
 }
@@ -38,59 +48,155 @@ pub static MIXER_CHANNELS: LazyLock<Mutex<HashMap<u8, MixerChannel>>> =
 pub static ENCODER_TO_CHANNEL_MAP: LazyLock<Mutex<HashMap<u8, u8>>> =
     LazyLock::new(|| Mutex::const_new(HashMap::new()));
 
-pub async fn create_mixer_channels(
-    applications: Vec<crate::audio::audio_system::AppInfo>,
-    ignored_apps: &[String],
+/// Count how many active streams share each PID, so the cold-start art claim can
+/// tell an unambiguous single-stream PID from an ambiguous multi-stream one.
+fn count_pids(apps: &[AppInfo]) -> HashMap<u32, usize> {
+    let mut counts: HashMap<u32, usize> = HashMap::new();
+    for app in apps {
+        if let Some(pid) = app.pid {
+            *counts.entry(pid).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Apply a claimed art file to a channel: mark the path claimed and rebuild the
+/// icon (normal + muted) from the art bytes.
+fn apply_art(
+    channel: &mut MixerChannel,
+    icon_name: Option<String>,
+    icon_search_name: String,
+    path: PathBuf,
+    bytes: Vec<u8>,
+    claimed_paths: &mut HashSet<PathBuf>,
 ) {
+    claimed_paths.insert(path.clone());
+    let (icon_uri, icon_uri_mute, uses_default_icon) =
+        get_app_icon_uri(icon_name, icon_search_name, Some(&bytes));
+    channel.icon_uri = icon_uri;
+    channel.icon_uri_mute = icon_uri_mute;
+    channel.uses_default_icon = uses_default_icon;
+    channel.mpris_art_data = Some(bytes);
+    channel.mpris_art_path = Some(path);
+}
+
+/// Make (or defer) the art-claim decision for a channel. No-op once resolved.
+///
+/// For an observed stream (`first_seen = Some`) it waits `SETTLE` for the art to
+/// be written, then commits a final decision either way. At cold start it
+/// best-effort claims for unambiguous single-stream PIDs and otherwise leaves
+/// the channel unresolved so a later refresh can try again once the art lands.
+fn resolve_art(
+    channel: &mut MixerChannel,
+    icon_name: Option<String>,
+    icon_search_name: String,
+    now: SystemTime,
+    pid_counts: &HashMap<u32, usize>,
+    claimed_paths: &mut HashSet<PathBuf>,
+) {
+    if channel.art_resolved {
+        return;
+    }
+    let Some(pid) = channel.pid else {
+        // Devices / system audio never have Firefox art; decision is immediate.
+        channel.art_resolved = true;
+        return;
+    };
+    let same_pid_count = pid_counts.get(&pid).copied().unwrap_or(1);
+
+    match channel.first_seen {
+        Some(first_seen) => {
+            // Too early: the browser may not have written art yet. Retry later.
+            let too_early = now
+                .duration_since(first_seen)
+                .map(|age| age < crate::mpris::SETTLE)
+                .unwrap_or(false);
+            if too_early {
+                return;
+            }
+            if let Some((path, bytes)) =
+                crate::mpris::claim_art(pid, Some(first_seen), same_pid_count, claimed_paths)
+            {
+                apply_art(channel, icon_name, icon_search_name, path, bytes, claimed_paths);
+            }
+            // Final whether or not a file matched.
+            channel.art_resolved = true;
+        }
+        None => {
+            // Cold start. Refuse to guess when the PID is shared.
+            if same_pid_count > 1 {
+                channel.art_resolved = true;
+                return;
+            }
+            if let Some((path, bytes)) =
+                crate::mpris::claim_art(pid, None, same_pid_count, claimed_paths)
+            {
+                apply_art(channel, icon_name, icon_search_name, path, bytes, claimed_paths);
+                channel.art_resolved = true;
+            }
+            // No art on disk yet → stay unresolved; a later refresh can claim it.
+        }
+    }
+}
+
+pub async fn create_mixer_channels(applications: Vec<AppInfo>, ignored_apps: &[String]) {
     let mut channels = MIXER_CHANNELS.lock().await;
     let mut claimed_paths: HashSet<PathBuf> = HashSet::new();
+    let now = SystemTime::now();
 
-    let mut col_key = 0;
+    let mut active: Vec<AppInfo> = Vec::new();
     for app in applications.into_iter() {
         if ignored_apps.contains(&app.app_name) {
             println!("Skipping ignored app: {}", app.app_name);
             continue;
         }
+        active.push(app);
+    }
+    let pid_counts = count_pids(&active);
 
-        // Try to claim an unclaimed MPRIS art file for this stream.
-        let (art_data, art_path) = match app.pid.and_then(|pid| crate::mpris::claim_art(pid, &claimed_paths)) {
-            Some((path, bytes)) => {
-                claimed_paths.insert(path.clone());
-                (Some(bytes), Some(path))
-            }
-            None => (None, None),
+    let mut col_key: u8 = 0;
+    for app in active.into_iter() {
+        let (icon_uri, icon_uri_mute, uses_default_icon) =
+            get_app_icon_uri(app.icon_name.clone(), app.icon_search_name.clone(), None);
+
+        let mut channel = MixerChannel {
+            header_id: None,
+            upper_vol_btn_id: None,
+            lower_vol_btn_id: None,
+            dial_id: None,
+            uid: app.uid,
+            pid: app.pid,
+            app_name: app.app_name.clone(),
+            sink_name: app.sink_name.clone(),
+            mute: app.mute,
+            vol_percent: app.vol_percent,
+            icon_uri,
+            icon_uri_mute,
+            uses_default_icon,
+            mpris_art_data: None,
+            mpris_art_path: None,
+            // Cold start: these streams may have been playing for a while, so we
+            // have no reliable timing anchor for them.
+            first_seen: None,
+            art_resolved: false,
+            locked: false,
+            is_device: app.is_device,
+            is_multi_sink_app: app.is_multi_sink_app,
         };
 
-        let has_good_name = !crate::mpris::is_generic_name(&app.app_name);
-        let locked = has_good_name && (art_data.is_some() || app.pid.is_none());
-
-        let (icon_uri, icon_uri_mute, uses_default_icon) =
-            get_app_icon_uri(app.icon_name, app.icon_search_name.clone(), art_data.as_deref());
-
-        channels.insert(
-            col_key as u8,
-            MixerChannel {
-                header_id: None,
-                upper_vol_btn_id: None,
-                lower_vol_btn_id: None,
-                dial_id: None,
-                uid: app.uid,
-                pid: app.pid,
-                app_name: app.app_name.clone(),
-                sink_name: app.sink_name.clone(),
-                mute: app.mute,
-                vol_percent: app.vol_percent,
-                icon_uri,
-                icon_uri_mute,
-                uses_default_icon,
-                mpris_art_data: art_data,
-                mpris_art_path: art_path,
-                locked,
-                is_device: app.is_device,
-                is_multi_sink_app: app.is_multi_sink_app,
-            },
+        resolve_art(
+            &mut channel,
+            app.icon_name,
+            app.icon_search_name,
+            now,
+            &pid_counts,
+            &mut claimed_paths,
         );
 
+        let has_good_name = !crate::mpris::is_generic_name(&channel.app_name);
+        channel.locked = has_good_name && channel.art_resolved;
+
+        channels.insert(col_key, channel);
         col_key += 1;
     }
 }
@@ -121,6 +227,9 @@ pub async fn update_mixer_channels(
         .filter_map(|(_, ch)| ch.mpris_art_path.clone())
         .collect();
 
+    let now = SystemTime::now();
+    let pid_counts = count_pids(&active_apps);
+
     let mut new_channels: HashMap<u8, MixerChannel> = HashMap::new();
     let mut col_key: u8 = 0;
 
@@ -142,6 +251,11 @@ pub async fn update_mixer_channels(
                     claimed_paths.remove(&old_path);
                 }
                 prev.mpris_art_data = None;
+                // New content is a fresh stream as far as art goes: re-anchor the
+                // timing and re-open the claim decision so the next refresh can
+                // bind the new art file by timing.
+                prev.first_seen = Some(now);
+                prev.art_resolved = false;
                 let (icon_uri, icon_uri_mute, uses_default_icon) = get_app_icon_uri(
                     app.icon_name.clone(),
                     app.icon_search_name.clone(),
@@ -150,23 +264,6 @@ pub async fn update_mixer_channels(
                 prev.icon_uri = icon_uri;
                 prev.icon_uri_mute = icon_uri_mute;
                 prev.uses_default_icon = uses_default_icon;
-            } else if prev.mpris_art_path.is_none() {
-                // Existing stream that has never had art: try to claim some now.
-                if let Some(pid) = app.pid {
-                    if let Some((path, bytes)) = crate::mpris::claim_art(pid, &claimed_paths) {
-                        claimed_paths.insert(path.clone());
-                        let (icon_uri, icon_uri_mute, uses_default_icon) = get_app_icon_uri(
-                            app.icon_name.clone(),
-                            app.icon_search_name.clone(),
-                            Some(&bytes),
-                        );
-                        prev.icon_uri = icon_uri;
-                        prev.icon_uri_mute = icon_uri_mute;
-                        prev.uses_default_icon = uses_default_icon;
-                        prev.mpris_art_data = Some(bytes);
-                        prev.mpris_art_path = Some(path);
-                    }
-                }
             }
 
             // Update live data
@@ -176,14 +273,23 @@ pub async fn update_mixer_channels(
             prev.is_device = app.is_device;
             prev.is_multi_sink_app = app.is_multi_sink_app;
 
+            // Make (or defer) the timing-aware art decision. No-op once resolved.
+            resolve_art(
+                &mut prev,
+                app.icon_name.clone(),
+                app.icon_search_name.clone(),
+                now,
+                &pid_counts,
+                &mut claimed_paths,
+            );
+
             // Upgrade a generic name if a better one is now available, then lock.
             if !prev.locked {
                 if !crate::mpris::is_generic_name(&app.app_name) {
                     prev.app_name = app.app_name;
                 }
                 let has_good_name = !crate::mpris::is_generic_name(&prev.app_name);
-                prev.locked = has_good_name
-                    && (prev.mpris_art_path.is_some() || app.pid.is_none());
+                prev.locked = has_good_name && prev.art_resolved;
             }
 
             // Clear position-specific IDs (will be reassigned by update_stream_deck_buttons)
@@ -216,8 +322,17 @@ pub async fn update_mixer_channels(
                 app.app_name.clone()
             };
 
+            // Anchor timing for streams with a PID (browser tabs); devices /
+            // system audio have no PID and never carry Firefox art, so their art
+            // decision is already final.
+            let (first_seen, art_resolved) = if app.pid.is_some() {
+                (Some(now), false)
+            } else {
+                (None, true)
+            };
+
             let has_good_name = !crate::mpris::is_generic_name(&display_name);
-            let locked = has_good_name && app.pid.is_none();
+            let locked = has_good_name && art_resolved;
 
             let (icon_uri, icon_uri_mute, uses_default_icon) =
                 get_app_icon_uri(app.icon_name, app.icon_search_name.clone(), None);
@@ -238,6 +353,8 @@ pub async fn update_mixer_channels(
                 uses_default_icon,
                 mpris_art_data: None,
                 mpris_art_path: None,
+                first_seen,
+                art_resolved,
                 locked,
                 is_device: app.is_device,
                 is_multi_sink_app: app.is_multi_sink_app,

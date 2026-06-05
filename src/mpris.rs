@@ -1,22 +1,37 @@
 use crate::audio::AppInfo;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-/// Find the newest unclaimed MPRIS art file for a given PID.
-/// Firefox writes art to ~/.config/mozilla/firefox/firefox-mpris/{PID}_{counter}.png
-/// Since multiple streams share a PID, callers pass the set of paths already claimed
-/// by other channels so a new slot never picks up another slot's art.
-fn get_mpris_art_for_pid(pid: u32, exclude: &HashSet<PathBuf>) -> Option<(PathBuf, Vec<u8>)> {
-    let home = std::env::var("HOME").ok()?;
+/// How far *before* a stream's first-seen time art may have been written and
+/// still be considered that stream's art (covers art landing slightly ahead of
+/// the sink-input being observed).
+const PRE_WINDOW: Duration = Duration::from_secs(2);
+/// How far *after* a stream's first-seen time art may arrive (browsers often
+/// write media-session art a few seconds after the audio element starts).
+const POST_WINDOW: Duration = Duration::from_secs(4);
+/// Minimum age of an observed stream before we commit to an art decision. Gives
+/// the browser time to write its art file before we look. The existing delayed
+/// refresh (~2s) is the refresh that clears this gate.
+pub const SETTLE: Duration = Duration::from_millis(1500);
+
+/// Enumerate unclaimed MPRIS art files for a PID, each paired with its birth
+/// time (falls back to mtime if the filesystem has no btime).
+/// Firefox writes art to ~/.config/mozilla/firefox/firefox-mpris/{PID}_{counter}.png.
+/// Since multiple streams share a PID, callers pass the set of paths already
+/// claimed by other channels so a new slot never picks up another slot's art.
+fn list_art_candidates(pid: u32, exclude: &HashSet<PathBuf>) -> Vec<(PathBuf, SystemTime)> {
+    let mut out: Vec<(PathBuf, SystemTime)> = Vec::new();
+
+    let Ok(home) = std::env::var("HOME") else {
+        return out;
+    };
     let mpris_dir = PathBuf::from(home).join(".config/mozilla/firefox/firefox-mpris");
     if !mpris_dir.exists() {
-        return None;
+        return out;
     }
 
     let prefix = format!("{}_", pid);
-    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
-
     if let Ok(entries) = std::fs::read_dir(&mpris_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -27,19 +42,88 @@ fn get_mpris_art_for_pid(pid: u32, exclude: &HashSet<PathBuf>) -> Option<(PathBu
                     continue;
                 }
                 if let Ok(meta) = entry.metadata() {
-                    if let Ok(modified) = meta.modified() {
-                        if newest.as_ref().is_none_or(|(t, _)| modified > *t) {
-                            newest = Some((modified, path));
-                        }
+                    // Prefer birth time; fall back to mtime where btime is absent.
+                    if let Ok(ts) = meta.created().or_else(|_| meta.modified()) {
+                        out.push((path, ts));
                     }
                 }
             }
         }
     }
 
-    let (_, path) = newest?;
-    let bytes = std::fs::read(&path).ok()?;
-    Some((path, bytes))
+    out
+}
+
+/// Result of selecting art for a stream from the candidate files.
+#[derive(Debug, PartialEq)]
+pub enum ArtPick {
+    Match(PathBuf),
+    NoArt,
+}
+
+/// Pure art-selection logic (no filesystem), so it can be unit-tested.
+///
+/// - `first_seen = Some(t)`: the stream's start was observed. Keep only files
+///   whose btime falls within `[t - PRE_WINDOW, t + POST_WINDOW]` and pick the
+///   one closest to `t`, biasing toward art written at/after `t`. No file in the
+///   window → `NoArt` (we refuse to borrow an unrelated sibling's art).
+/// - `first_seen = None`: the stream was already playing at cold start (true
+///   start unknown). If it's the only browser stream on its PID, best-effort
+///   pick the newest file; if it shares the PID with others, `NoArt` (we can't
+///   disambiguate without a timing anchor).
+pub fn pick_art(
+    candidates: &[(PathBuf, SystemTime)],
+    first_seen: Option<SystemTime>,
+    same_pid_count: usize,
+) -> ArtPick {
+    match first_seen {
+        Some(t) => {
+            let lo = t.checked_sub(PRE_WINDOW);
+            let hi = t.checked_add(POST_WINDOW);
+
+            // Track the best candidate by (distance to t, prefer at/after t).
+            let mut best: Option<(&PathBuf, Duration, bool)> = None;
+            for (path, bt) in candidates {
+                if let Some(lo) = lo {
+                    if *bt < lo {
+                        continue;
+                    }
+                }
+                if let Some(hi) = hi {
+                    if *bt > hi {
+                        continue;
+                    }
+                }
+                let (dist, after) = match bt.duration_since(t) {
+                    Ok(d) => (d, true),              // bt >= t
+                    Err(e) => (e.duration(), false), // bt <  t
+                };
+                let better = match &best {
+                    None => true,
+                    Some((_, best_dist, best_after)) => {
+                        dist < *best_dist || (dist == *best_dist && after && !*best_after)
+                    }
+                };
+                if better {
+                    best = Some((path, dist, after));
+                }
+            }
+
+            match best {
+                Some((path, _, _)) => ArtPick::Match(path.clone()),
+                None => ArtPick::NoArt,
+            }
+        }
+        None => {
+            if same_pid_count > 1 {
+                return ArtPick::NoArt;
+            }
+            match candidates.iter().max_by_key(|(_, bt)| *bt) {
+                Some((path, _)) => ArtPick::Match(path.clone()),
+                None => ArtPick::NoArt,
+            }
+        }
+    }
 }
 
 /// Check if a name is a generic placeholder that shouldn't be displayed.
@@ -52,10 +136,23 @@ pub fn is_generic_name(name: &str) -> bool {
         || lower == "playback"
 }
 
-/// Try to claim unclaimed MPRIS art for a PID.
-/// Returns the file path (so the caller can mark it as claimed) and the bytes.
-pub fn claim_art(pid: u32, exclude: &HashSet<PathBuf>) -> Option<(PathBuf, Vec<u8>)> {
-    get_mpris_art_for_pid(pid, exclude)
+/// Try to claim unclaimed MPRIS art for a PID, tying the file to the stream by
+/// timing (see [`pick_art`]). Returns the file path (so the caller can mark it
+/// claimed) and the bytes, or `None` when nothing correlates confidently.
+pub fn claim_art(
+    pid: u32,
+    first_seen: Option<SystemTime>,
+    same_pid_count: usize,
+    exclude: &HashSet<PathBuf>,
+) -> Option<(PathBuf, Vec<u8>)> {
+    let candidates = list_art_candidates(pid, exclude);
+    match pick_art(&candidates, first_seen, same_pid_count) {
+        ArtPick::Match(path) => {
+            let bytes = std::fs::read(&path).ok()?;
+            Some((path, bytes))
+        }
+        ArtPick::NoArt => None,
+    }
 }
 
 /// Trailing boilerplate that browsers append to the page <title>. Stripped
@@ -198,6 +295,81 @@ mod tests {
     #[test]
     fn leaves_unrecognized_titles_untouched() {
         assert_eq!(clean_stream_title("Just A Title"), "Just A Title");
+    }
+
+    // --- pick_art selection logic ---
+
+    /// A fixed base time well clear of UNIX_EPOCH so we can offset in either
+    /// direction without underflowing.
+    fn base() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000)
+    }
+
+    fn at(offset_secs: i64) -> SystemTime {
+        if offset_secs >= 0 {
+            base() + Duration::from_secs(offset_secs as u64)
+        } else {
+            base() - Duration::from_secs((-offset_secs) as u64)
+        }
+    }
+
+    fn cand(name: &str, offset_secs: i64) -> (PathBuf, SystemTime) {
+        (PathBuf::from(name), at(offset_secs))
+    }
+
+    #[test]
+    fn observed_match_in_window() {
+        let cands = vec![cand("a.png", 1)];
+        assert_eq!(
+            pick_art(&cands, Some(base()), 1),
+            ArtPick::Match(PathBuf::from("a.png"))
+        );
+    }
+
+    #[test]
+    fn observed_no_match_outside_window() {
+        // +10s is past POST_WINDOW (5s).
+        let cands = vec![cand("a.png", 10)];
+        assert_eq!(pick_art(&cands, Some(base()), 1), ArtPick::NoArt);
+    }
+
+    #[test]
+    fn observed_picks_closest() {
+        let cands = vec![cand("far.png", 4), cand("near.png", 1)];
+        assert_eq!(
+            pick_art(&cands, Some(base()), 1),
+            ArtPick::Match(PathBuf::from("near.png"))
+        );
+    }
+
+    #[test]
+    fn observed_tiebreak_prefers_after() {
+        // Equal distance (1s) on either side → prefer art written at/after start.
+        let cands = vec![cand("before.png", -1), cand("after.png", 1)];
+        assert_eq!(
+            pick_art(&cands, Some(base()), 1),
+            ArtPick::Match(PathBuf::from("after.png"))
+        );
+    }
+
+    #[test]
+    fn cold_start_single_stream_picks_newest() {
+        let cands = vec![cand("old.png", -100), cand("new.png", -10)];
+        assert_eq!(
+            pick_art(&cands, None, 1),
+            ArtPick::Match(PathBuf::from("new.png"))
+        );
+    }
+
+    #[test]
+    fn cold_start_ambiguous_pid_refuses() {
+        let cands = vec![cand("a.png", -10), cand("b.png", -5)];
+        assert_eq!(pick_art(&cands, None, 2), ArtPick::NoArt);
+    }
+
+    #[test]
+    fn cold_start_no_files_is_no_art() {
+        assert_eq!(pick_art(&[], None, 1), ArtPick::NoArt);
     }
 
     // Live check against the running session bus. Run with:
