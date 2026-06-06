@@ -468,6 +468,78 @@ impl Action for VolumeControllerAction {
 
         Ok(())
     }
+
+    async fn touch_tap(
+        &self,
+        instance: &Instance,
+        _: &Self::Settings,
+        hold: bool,
+        _tap_pos: [u16; 2],
+    ) -> OpenActionResult<()> {
+        let dial_pos = instance.coordinates.as_ref().map(|c| c.column).unwrap_or(0);
+        let encoder_map = ENCODER_TO_CHANNEL_MAP.lock().await;
+        let Some(&channel_index) = encoder_map.get(&dial_pos) else {
+            return Ok(());
+        };
+        drop(encoder_map);
+
+        if !hold {
+            // Short tap: toggle mute, same as pressing the dial.
+            let mut channels = mixer::MIXER_CHANNELS.lock().await;
+            let Some(channel) = channels.get_mut(&channel_index) else {
+                return Ok(());
+            };
+            channel.mute = !channel.mute;
+            let uid = channel.uid;
+            let mute = channel.mute;
+            let is_device = channel.is_device;
+            drop(channels);
+
+            let mut audio = audio::create();
+            let _ = audio.mute_volume(uid, mute, is_device);
+            return Ok(());
+        }
+
+        // Long press: dismiss this stream (unmute it and add it to the ignore list),
+        // mirroring the long-press behaviour of the keypad mute button.
+        let mut channels = mixer::MIXER_CHANNELS.lock().await;
+        let Some(channel) = channels.get_mut(&channel_index) else {
+            return Ok(());
+        };
+        let app_name = channel.app_name.clone();
+        let uid = channel.uid;
+        let is_device = channel.is_device;
+        channel.mute = false;
+        drop(channels);
+
+        {
+            let mut audio = audio::create();
+            if let Err(e) = audio.mute_volume(uid, false, is_device) {
+                println!("Warning: Failed to unmute audio: {}", e);
+            }
+        }
+
+        let updated_settings = {
+            let mut shared_settings = SHARED_SETTINGS.lock().await;
+            if !shared_settings.ignored_apps_list.contains(&app_name) {
+                shared_settings.ignored_apps_list.push(app_name.clone());
+            }
+            shared_settings.clone()
+        };
+
+        let global = GlobalPluginSettings {
+            ignored_apps_list: updated_settings.ignored_apps_list.clone(),
+            volume_increment: updated_settings.volume_increment,
+        };
+        let _ = set_global_settings(global).await;
+
+        for inst in visible_instances(Self::UUID).await {
+            let _ = inst.set_settings(&updated_settings).await;
+        }
+
+        println!("Touch-dismissed {} (added to ignored apps list)", app_name);
+        Ok(())
+    }
 }
 
 pub async fn init() -> OpenActionResult<()> {
