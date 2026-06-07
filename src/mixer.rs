@@ -54,6 +54,51 @@ pub static MIXER_CHANNELS: LazyLock<Mutex<HashMap<u8, MixerChannel>>> =
 pub static ENCODER_TO_CHANNEL_MAP: LazyLock<Mutex<HashMap<u8, u8>>> =
     LazyLock::new(|| Mutex::const_new(HashMap::new()));
 
+/// How long a logical stream's art is remembered after the sink-input it was
+/// attached to disappears. Long enough to bridge a stream being torn down and
+/// recreated under a new sink-input index (e.g. a browser re-routing a `<video>`
+/// through the Web Audio API for a compressor/EQ), short enough that art is not
+/// mis-applied to an unrelated later stream that happens to reuse the identity.
+const ART_MEMORY_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// MPRIS art remembered by *logical* stream identity (PID + display name) rather
+/// than the volatile sink-input index that drives `MixerChannel::uid`. When a
+/// stream is recreated under a new index its successor can inherit this art
+/// instead of reverting to a generic app icon. See `update_mixer_channels`.
+struct RememberedArt {
+    path: PathBuf,
+    data: Vec<u8>,
+    last_seen: SystemTime,
+}
+
+static ART_MEMORY: LazyLock<std::sync::Mutex<HashMap<(u32, String), RememberedArt>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Record a channel's claimed art under its logical identity, if it has both a
+/// PID and a real (non-generic) name. No-op for channels without art.
+fn remember_channel_art(
+    mem: &mut HashMap<(u32, String), RememberedArt>,
+    ch: &MixerChannel,
+    now: SystemTime,
+) {
+    if crate::mpris::is_generic_name(&ch.app_name) {
+        return;
+    }
+    let (Some(pid), Some(path), Some(data)) =
+        (ch.pid, ch.mpris_art_path.clone(), ch.mpris_art_data.clone())
+    else {
+        return;
+    };
+    mem.insert(
+        (pid, ch.app_name.clone()),
+        RememberedArt {
+            path,
+            data,
+            last_seen: now,
+        },
+    );
+}
+
 /// Count how many active streams share each PID, so the cold-start art claim can
 /// tell an unambiguous single-stream PID from an ambiguous multi-stream one.
 fn count_pids(apps: &[AppInfo]) -> HashMap<u32, usize> {
@@ -250,6 +295,23 @@ pub async fn update_mixer_channels(
     let now = SystemTime::now();
     let pid_counts = count_pids(&active_apps);
 
+    // Remember every prior channel's art by logical identity *before* processing.
+    // This deliberately captures streams that are about to disappear this refresh
+    // (their uid is gone from the active set): a recreated stream's successor,
+    // processed below, inherits exactly that just-departed predecessor's art.
+    // Pruning here also bounds the table to the grace window.
+    {
+        let mut mem = ART_MEMORY.lock().unwrap();
+        mem.retain(|_, a| {
+            now.duration_since(a.last_seen)
+                .map(|age| age < ART_MEMORY_TTL)
+                .unwrap_or(true)
+        });
+        for ch in previous_by_uid.values() {
+            remember_channel_art(&mut mem, ch, now);
+        }
+    }
+
     let mut new_channels: HashMap<u8, MixerChannel> = HashMap::new();
     let mut col_key: u8 = 0;
 
@@ -346,25 +408,85 @@ pub async fn update_mixer_channels(
                 app.app_name.clone()
             };
 
-            // Anchor timing for streams with a PID (browser tabs); devices /
-            // system audio have no PID and never carry Firefox art, so their art
-            // decision is already final.
-            let (first_seen, art_resolved) = if app.pid.is_some() {
-                (Some(now), false)
+            // Before treating this as a cold stream, check whether it's really the
+            // successor of a just-departed (or very recently seen) stream with the
+            // same logical identity (PID + display name) — e.g. a browser that
+            // re-routed its audio through the Web Audio API, replacing the
+            // sink-input under a new index. `uid` can't catch this because it *is*
+            // the index; the identity-keyed memory can. Inheriting art skips the
+            // generic-icon flash and the timing-window reclaim entirely. Never
+            // steal art a still-active sibling already holds this refresh.
+            let inherited_art = if !crate::mpris::is_generic_name(&display_name) {
+                app.pid.and_then(|pid| {
+                    let mem = ART_MEMORY.lock().unwrap();
+                    mem.get(&(pid, display_name.clone())).and_then(|a| {
+                        if claimed_paths.contains(&a.path) {
+                            None
+                        } else {
+                            Some((a.path.clone(), a.data.clone()))
+                        }
+                    })
+                })
             } else {
-                (None, true)
+                None
+            };
+
+            // With inherited art the decision is final; otherwise anchor timing for
+            // streams with a PID (browser tabs) so the delayed refresh can claim a
+            // freshly written art file. Devices / system audio have no PID and never
+            // carry Firefox art, so their art decision is already final.
+            let (
+                icon_uri,
+                icon_uri_mute,
+                uses_default_icon,
+                mpris_art_data,
+                mpris_art_path,
+                first_seen,
+                art_resolved,
+            ) = if let Some((path, data)) = inherited_art {
+                claimed_paths.insert(path.clone());
+                let (icon_uri, icon_uri_mute, uses_default_icon) = get_app_icon_uri(
+                    app.icon_name.clone(),
+                    app.icon_search_name.clone(),
+                    Some(&data),
+                    None,
+                    None,
+                );
+                (
+                    icon_uri,
+                    icon_uri_mute,
+                    uses_default_icon,
+                    Some(data),
+                    Some(path),
+                    Some(now),
+                    true,
+                )
+            } else {
+                let (first_seen, art_resolved) = if app.pid.is_some() {
+                    (Some(now), false)
+                } else {
+                    (None, true)
+                };
+                let (icon_uri, icon_uri_mute, uses_default_icon) = get_app_icon_uri(
+                    app.icon_name.clone(),
+                    app.icon_search_name.clone(),
+                    None,
+                    app.wm_class.as_deref(),
+                    app.window_icon.as_ref(),
+                );
+                (
+                    icon_uri,
+                    icon_uri_mute,
+                    uses_default_icon,
+                    None,
+                    None,
+                    first_seen,
+                    art_resolved,
+                )
             };
 
             let has_good_name = !crate::mpris::is_generic_name(&display_name);
             let locked = has_good_name && art_resolved;
-
-            let (icon_uri, icon_uri_mute, uses_default_icon) = get_app_icon_uri(
-                app.icon_name.clone(),
-                app.icon_search_name.clone(),
-                None,
-                app.wm_class.as_deref(),
-                app.window_icon.as_ref(),
-            );
 
             MixerChannel {
                 header_id: None,
@@ -382,8 +504,8 @@ pub async fn update_mixer_channels(
                 icon_uri,
                 icon_uri_mute,
                 uses_default_icon,
-                mpris_art_data: None,
-                mpris_art_path: None,
+                mpris_art_data,
+                mpris_art_path,
                 first_seen,
                 art_resolved,
                 locked,
@@ -394,6 +516,16 @@ pub async fn update_mixer_channels(
 
         new_channels.insert(col_key, channel);
         col_key += 1;
+    }
+
+    // Refresh the identity memory with every currently-live channel's art so its
+    // grace window is measured from now. This keeps art for a still-playing stream
+    // alive indefinitely and only starts the TTL countdown once it truly stops.
+    {
+        let mut mem = ART_MEMORY.lock().unwrap();
+        for ch in new_channels.values() {
+            remember_channel_art(&mut mem, ch, now);
+        }
     }
 
     *channels = new_channels;
