@@ -3,6 +3,10 @@ use std::error::Error;
 #[derive(Debug)]
 pub struct AppInfo {
     pub uid: u32,
+    /// Every PulseAudio sink-input index this entry controls. Usually just
+    /// `[uid]`, but a collapsed app (e.g. a game opening "audio stream #1/2/3")
+    /// carries all of its streams here so volume/mute apply to all of them.
+    pub member_uids: Vec<u32>,
     pub app_name: String,
     pub icon_search_name: String,
     pub pid: Option<u32>,

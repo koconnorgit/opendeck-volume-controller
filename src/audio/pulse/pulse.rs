@@ -62,6 +62,56 @@ fn get_icon_search_name(app: &ApplicationInfo) -> String {
         .to_lowercase()
 }
 
+/// Collapse sink-inputs that belong to the same process *and* share a display
+/// name into a single entry that controls all of them. This catches an app (e.g.
+/// a Wine/Proton game) that opens several indistinct streams like "audio stream
+/// #1/2/3" — they all resolve to the same `node.name`, so they group together.
+///
+/// Streams that are meaningfully distinct keep different display names (browser
+/// tabs carry their tab title via `media.name`), so they have different group
+/// keys and are left untouched. Streams without a PID can't be safely attributed
+/// to a process, so they pass through individually.
+///
+/// The merged entry keeps the lowest member uid as its stable identity, reports
+/// the loudest member's volume, is muted only when every member is muted, and
+/// lists all member uids so volume/mute can be applied to the whole group.
+fn collapse_indistinct(streams: Vec<AppInfo>) -> Vec<AppInfo> {
+    let key_of = |s: &AppInfo| s.pid.map(|pid| (pid, s.app_name.to_lowercase()));
+
+    let mut counts: HashMap<(u32, String), usize> = HashMap::new();
+    for s in &streams {
+        if let Some(k) = key_of(s) {
+            *counts.entry(k).or_insert(0) += 1;
+        }
+    }
+
+    let mut out: Vec<AppInfo> = Vec::with_capacity(streams.len());
+    let mut merged_idx: HashMap<(u32, String), usize> = HashMap::new();
+
+    for s in streams {
+        match key_of(&s) {
+            Some(k) if counts[&k] > 1 => {
+                if let Some(&idx) = merged_idx.get(&k) {
+                    let m = &mut out[idx];
+                    m.member_uids.push(s.uid);
+                    m.uid = m.uid.min(s.uid); // stable identity = lowest uid
+                    m.vol_percent = m.vol_percent.max(s.vol_percent); // loudest member
+                    m.mute = m.mute && s.mute; // muted only if all are muted
+                } else {
+                    merged_idx.insert(k, out.len());
+                    out.push(s);
+                }
+            }
+            _ => out.push(s),
+        }
+    }
+
+    for a in &mut out {
+        a.member_uids.sort_unstable();
+    }
+    out
+}
+
 pub struct PulseAudioSystem {
     controller: SinkController,
 }
@@ -120,9 +170,6 @@ impl AudioSystem for PulseAudioSystem {
         // sink-input proplist is sparse (e.g. pipewire-native apps).
         let client_map = self.client_proplist_map();
 
-        // Collect all app names including system mixer if present
-        let mut app_names: Vec<String> = apps.iter().map(get_display_name).collect();
-
         // Add the default system sink (main PC audio) only if the global flag is set
         if crate::utils::should_show_system_mixer()
             && let Ok(default_sink) = self.controller.get_default_device()
@@ -132,11 +179,9 @@ impl AudioSystem for PulseAudioSystem {
                 .clone()
                 .unwrap_or("System Audio".to_string());
 
-            // Add system mixer name to app_names for duplicate detection
-            app_names.push(system_name.clone());
-
             res.push(AppInfo {
                 uid: default_sink.index,
+                member_uids: vec![default_sink.index],
                 app_name: system_name.clone(),
                 icon_search_name: system_name,
                 pid: None,
@@ -154,19 +199,18 @@ impl AudioSystem for PulseAudioSystem {
             });
         }
 
-        res.extend(apps.into_iter().map(|app| {
+        let streams: Vec<AppInfo> = apps.into_iter().map(|app| {
             let app_name = get_display_name(&app);
             let icon_search_name = get_icon_search_name(&app);
 
             let pid = app.proplist.get_str("application.process.id")
                 .and_then(|s| s.parse::<u32>().ok());
 
-            let name_count = app_names.iter().filter(|name| name.eq_ignore_ascii_case(&app_name)).count();
-
             let client = app.client.and_then(|c| client_map.get(&c));
 
             AppInfo {
                 uid: app.index,
+                member_uids: vec![app.index],
                 app_name,
                 icon_search_name,
                 pid,
@@ -175,14 +219,29 @@ impl AudioSystem for PulseAudioSystem {
                 vol_percent: get_pulse_app_volume_percentage(&app.volume),
                 icon_name: app.proplist.get_str("application.icon_name"),
                 is_device: false,
-                is_multi_sink_app: name_count > 1,
+                is_multi_sink_app: false, // recomputed below, after collapsing
                 client_pid: client.and_then(|c| c.pid),
                 client_name: client.and_then(|c| c.name.clone()),
                 client_binary: client.and_then(|c| c.binary.clone()),
                 wm_class: None,
                 window_icon: None,
             }
-        }));
+        }).collect();
+
+        res.extend(collapse_indistinct(streams));
+
+        // Flag any remaining same-named streams (e.g. two separate instances of
+        // the same app on different PIDs) so the UI can fall back to per-stream
+        // labels. Collapsed groups are already a single entry, so they won't trip
+        // this and will keep showing their real app name.
+        let mut name_counts: HashMap<String, usize> = HashMap::new();
+        for a in &res {
+            *name_counts.entry(a.app_name.to_lowercase()).or_insert(0) += 1;
+        }
+        for a in res.iter_mut().filter(|a| !a.is_device) {
+            a.is_multi_sink_app =
+                name_counts.get(&a.app_name.to_lowercase()).copied().unwrap_or(1) > 1;
+        }
 
         Ok(res)
     }
@@ -249,4 +308,76 @@ fn get_pulse_app_volume_percentage(channel_volumes: &ChannelVolumes) -> f32 {
     let perc = (avg_volume / PA_VOLUME_NORM as f32) * 100.0;
 
     perc.min(100.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn app(uid: u32, pid: Option<u32>, name: &str, vol: f32, mute: bool) -> AppInfo {
+        AppInfo {
+            uid,
+            member_uids: vec![uid],
+            app_name: name.to_string(),
+            icon_search_name: name.to_lowercase(),
+            pid,
+            sink_name: None,
+            mute,
+            vol_percent: vol,
+            icon_name: None,
+            is_device: false,
+            is_multi_sink_app: false,
+            client_pid: None,
+            client_name: None,
+            client_binary: None,
+            wm_class: None,
+            window_icon: None,
+        }
+    }
+
+    #[test]
+    fn collapses_same_pid_same_name_streams() {
+        // A game (one PID) opening three indistinct streams + a separate browser.
+        let out = collapse_indistinct(vec![
+            app(101, Some(3651136), "Gothic 1 Remake", 76.0, false),
+            app(102, Some(3651136), "Gothic 1 Remake", 46.0, false),
+            app(103, Some(3651136), "Gothic 1 Remake", 78.0, false),
+            app(200, Some(1577), "MidnightSumo - Twitch", 50.0, false),
+        ]);
+
+        assert_eq!(out.len(), 2, "Gothic's 3 streams collapse to 1, Firefox stays");
+        let gothic = out.iter().find(|a| a.app_name == "Gothic 1 Remake").unwrap();
+        assert_eq!(gothic.member_uids, vec![101, 102, 103], "controls all 3 streams");
+        assert_eq!(gothic.uid, 101, "stable identity = lowest uid");
+        assert_eq!(gothic.vol_percent, 78.0, "reports the loudest member");
+    }
+
+    #[test]
+    fn mute_only_when_all_members_muted() {
+        let all_muted = collapse_indistinct(vec![
+            app(1, Some(9), "Game", 50.0, true),
+            app(2, Some(9), "Game", 50.0, true),
+        ]);
+        assert!(all_muted[0].mute, "muted when every member is muted");
+
+        let partial = collapse_indistinct(vec![
+            app(1, Some(9), "Game", 50.0, true),
+            app(2, Some(9), "Game", 50.0, false),
+        ]);
+        assert!(!partial[0].mute, "unmuted when any member is unmuted");
+    }
+
+    #[test]
+    fn keeps_distinct_and_pidless_streams_separate() {
+        // Two browser tabs (same PID, different titles) must stay separate,
+        // and a stream without a PID is never grouped.
+        let out = collapse_indistinct(vec![
+            app(1, Some(50), "YouTube — song A", 50.0, false),
+            app(2, Some(50), "Twitch — stream B", 50.0, false),
+            app(3, None, "Some App", 50.0, false),
+            app(4, None, "Some App", 50.0, false),
+        ]);
+        assert_eq!(out.len(), 4, "distinct tabs and pid-less streams are untouched");
+        assert!(out.iter().all(|a| a.member_uids.len() == 1));
+    }
 }

@@ -13,6 +13,10 @@ pub struct MixerChannel {
     pub lower_vol_btn_id: Option<String>,
     pub dial_id: Option<String>,
     pub uid: u32,
+    /// All sink-input indices this channel controls (collapsed multi-stream apps
+    /// list every member here; a normal channel just holds `[uid]`). Volume and
+    /// mute are applied to every member.
+    pub member_uids: Vec<u32>,
     pub pid: Option<u32>,
     pub app_name: String,
     pub sink_name: Option<String>,
@@ -170,6 +174,7 @@ pub async fn create_mixer_channels(applications: Vec<AppInfo>, ignored_apps: &[S
             lower_vol_btn_id: None,
             dial_id: None,
             uid: app.uid,
+            member_uids: app.member_uids.clone(),
             pid: app.pid,
             app_name: app.app_name.clone(),
             sink_name: app.sink_name.clone(),
@@ -279,6 +284,7 @@ pub async fn update_mixer_channels(
             prev.sink_name = app.sink_name;
             prev.is_device = app.is_device;
             prev.is_multi_sink_app = app.is_multi_sink_app;
+            prev.member_uids = app.member_uids.clone();
 
             // Make (or defer) the timing-aware art decision. No-op once resolved.
             resolve_art(
@@ -355,6 +361,7 @@ pub async fn update_mixer_channels(
                 lower_vol_btn_id: None,
                 dial_id: None,
                 uid: app.uid,
+                member_uids: app.member_uids.clone(),
                 pid: app.pid,
                 app_name: display_name,
                 sink_name: app.sink_name,

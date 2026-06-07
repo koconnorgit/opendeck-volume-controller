@@ -295,7 +295,7 @@ impl Action for VolumeControllerAction {
 
                 if let Some(channel) = channels.get_mut(&channel_index) {
                     let app_name = channel.app_name.clone();
-                    let uid = channel.uid;
+                    let members = channel.member_uids.clone();
                     let is_device = channel.is_device;
 
                     channel.mute = false;
@@ -306,8 +306,10 @@ impl Action for VolumeControllerAction {
 
                     {
                         let mut audio_system = audio::create();
-                        if let Err(e) = audio_system.mute_volume(uid, false, is_device) {
-                            println!("Warning: Failed to unmute audio: {}", e);
+                        for uid in &members {
+                            if let Err(e) = audio_system.mute_volume(*uid, false, is_device) {
+                                println!("Warning: Failed to unmute audio: {}", e);
+                            }
                         }
                     } // audio_system is dropped here
 
@@ -364,43 +366,41 @@ impl Action for VolumeControllerAction {
             match coords.row {
                 0 => {
                     channel.mute = !channel.mute;
+                    let mute = channel.mute;
+                    let is_device = channel.is_device;
                     let mut audio_system = audio::create();
-                    if let Err(e) = audio_system.mute_volume(channel.uid, channel.mute, channel.is_device) {
-                        println!("Warning: Failed to toggle mute for {}: {}", channel.app_name, e);
-                    } else {
-                        println!("Muting app {}", channel.app_name);
+                    for uid in &channel.member_uids {
+                        if let Err(e) = audio_system.mute_volume(*uid, mute, is_device) {
+                            println!("Warning: Failed to toggle mute for {}: {}", channel.app_name, e);
+                        }
                     }
+                    println!("Muting app {}", channel.app_name);
                 }
                 1 => {
-                    let app_uid = channel.uid;
-
                     if channel.vol_percent >= 100.0 {
                         return Ok(());
                     }
 
+                    let is_device = channel.is_device;
                     let increment = SHARED_SETTINGS.lock().await.volume_increment;
                     let mut audio_system = audio::create();
-                    if let Err(e) = audio_system.increase_volume(app_uid, increment, channel.is_device) {
-                        println!("Warning: Failed to increase volume for {}: {}", channel.app_name, e);
-                    } else {
-                        println!(
-                            "Volume up in app {} {}",
-                            channel.app_name, channel.vol_percent
-                        );
+                    for uid in &channel.member_uids {
+                        if let Err(e) = audio_system.increase_volume(*uid, increment, is_device) {
+                            println!("Warning: Failed to increase volume for {}: {}", channel.app_name, e);
+                        }
                     }
+                    println!("Volume up in app {} {}", channel.app_name, channel.vol_percent);
                 }
                 2 => {
-                    let app_uid = channel.uid;
+                    let is_device = channel.is_device;
                     let increment = SHARED_SETTINGS.lock().await.volume_increment;
                     let mut audio_system = audio::create();
-                    if let Err(e) = audio_system.decrease_volume(app_uid, increment, channel.is_device) {
-                        println!("Warning: Failed to decrease volume for {}: {}", channel.app_name, e);
-                    } else {
-                        println!(
-                            "Volume down in app {} {}",
-                            channel.app_name, channel.vol_percent
-                        );
+                    for uid in &channel.member_uids {
+                        if let Err(e) = audio_system.decrease_volume(*uid, increment, is_device) {
+                            println!("Warning: Failed to decrease volume for {}: {}", channel.app_name, e);
+                        }
                     }
+                    println!("Volume down in app {} {}", channel.app_name, channel.vol_percent);
                 }
                 _ => {}
             }
@@ -428,17 +428,19 @@ impl Action for VolumeControllerAction {
             return Ok(());
         };
 
-        let uid = channel.uid;
+        let members = channel.member_uids.clone();
         let is_device = channel.is_device;
         drop(channels);
 
         let increment = SHARED_SETTINGS.lock().await.volume_increment * ticks.abs() as f64;
 
         let mut audio = audio::create();
-        if ticks > 0 {
-            let _ = audio.increase_volume(uid, increment, is_device);
-        } else if ticks < 0 {
-            let _ = audio.decrease_volume(uid, increment, is_device);
+        for uid in &members {
+            if ticks > 0 {
+                let _ = audio.increase_volume(*uid, increment, is_device);
+            } else if ticks < 0 {
+                let _ = audio.decrease_volume(*uid, increment, is_device);
+            }
         }
 
         Ok(())
@@ -458,13 +460,15 @@ impl Action for VolumeControllerAction {
         };
 
         channel.mute = !channel.mute;
-        let uid = channel.uid;
+        let members = channel.member_uids.clone();
         let mute = channel.mute;
         let is_device = channel.is_device;
         drop(channels);
 
         let mut audio = audio::create();
-        let _ = audio.mute_volume(uid, mute, is_device);
+        for uid in &members {
+            let _ = audio.mute_volume(*uid, mute, is_device);
+        }
 
         Ok(())
     }
@@ -490,13 +494,15 @@ impl Action for VolumeControllerAction {
                 return Ok(());
             };
             channel.mute = !channel.mute;
-            let uid = channel.uid;
+            let members = channel.member_uids.clone();
             let mute = channel.mute;
             let is_device = channel.is_device;
             drop(channels);
 
             let mut audio = audio::create();
-            let _ = audio.mute_volume(uid, mute, is_device);
+            for uid in &members {
+                let _ = audio.mute_volume(*uid, mute, is_device);
+            }
             return Ok(());
         }
 
@@ -507,15 +513,17 @@ impl Action for VolumeControllerAction {
             return Ok(());
         };
         let app_name = channel.app_name.clone();
-        let uid = channel.uid;
+        let members = channel.member_uids.clone();
         let is_device = channel.is_device;
         channel.mute = false;
         drop(channels);
 
         {
             let mut audio = audio::create();
-            if let Err(e) = audio.mute_volume(uid, false, is_device) {
-                println!("Warning: Failed to unmute audio: {}", e);
+            for uid in &members {
+                if let Err(e) = audio.mute_volume(*uid, false, is_device) {
+                    println!("Warning: Failed to unmute audio: {}", e);
+                }
             }
         }
 
