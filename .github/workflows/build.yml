@@ -104,6 +104,18 @@ jobs:
           cp Cargo.toml "$PLUGIN_DIR/"
           cp Cargo.lock "$PLUGIN_DIR/"
 
+          # Stamp the bundled manifest's Version from the release tag (strip leading "v"),
+          # so the installed plugin reports the released version regardless of the committed value.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${VERSION#v}"
+          jq --arg v "$VERSION" '.Version = $v' "$PLUGIN_DIR/manifest.json" > "$PLUGIN_DIR/manifest.tmp"
+          mv "$PLUGIN_DIR/manifest.tmp" "$PLUGIN_DIR/manifest.json"
+          echo "Stamped manifest Version = $VERSION"
+
           # Copy img directory
           cp -r img "$PLUGIN_DIR/"
 
@@ -161,21 +173,26 @@ jobs:
         id: release_notes
         run: |
           cat > release_notes.md << 'EOF'
-          ## Volume Controller Plugin Release
+          ## Volume Controller Plugin
+
+          Per-application volume control for Stream Deck on Linux (OpenDeck + PulseAudio/PipeWire).
 
           ### Installation
-          1. Download the `${{ steps.plugin_name.outputs.zip_name }}` file
-          2. Extract it to your OpenDeck plugins directory
+          1. Download `${{ steps.plugin_name.outputs.zip_name }}` below
+          2. Extract it into your OpenDeck plugins directory (`~/.config/opendeck/plugins/`)
           3. Restart OpenDeck
 
-          ### Features
-          - Per-app volume control
-          - Persistent ignored apps list
-          - System mixer toggle
-          - PulseAudio integration
+          Ships native binaries for `x86_64` and `aarch64` Linux.
 
-          ### Changes
-          See commit history for detailed changes.
+          ### Features
+          - Per-app volume control with live volume bars and app icons
+          - Keypad grid layout and Stream Deck + / + XL encoder/dial layout
+          - Encoder LCD: rotate to adjust, press to mute, **tap to mute / long-press to dismiss**
+          - Persistent ignored-apps list and optional system mixer toggle
+
+          > **Note:** LCD touch-to-mute requires an OpenDeck build that emits `touchTap`
+          > (e.g. one with Stream Deck + touchscreen support). On stock OpenDeck, touch is
+          > inert and the dial press still mutes.
           EOF
 
       - name: Create or update release
@@ -185,6 +202,7 @@ jobs:
           name: Release ${{ steps.version.outputs.version }}
           body_path: release_notes.md
           files: ${{ steps.plugin_name.outputs.zip_name }}
+          generate_release_notes: true
           draft: true
           prerelease: false
         env:
