@@ -295,6 +295,7 @@ impl Action for VolumeControllerAction {
 
                 if let Some(channel) = channels.get_mut(&channel_index) {
                     let app_name = channel.app_name.clone();
+                    let app_id = channel.app_id.clone();
                     let members = channel.member_uids.clone();
                     let is_device = channel.is_device;
 
@@ -316,8 +317,8 @@ impl Action for VolumeControllerAction {
                     // Read cached shared settings, append app, and save back
                     let updated_settings = {
                         let mut shared_settings = SHARED_SETTINGS.lock().await;
-                        if !shared_settings.ignored_apps_list.contains(&app_name) {
-                            shared_settings.ignored_apps_list.push(app_name.clone());
+                        if !shared_settings.ignored_apps_list.contains(&app_id) {
+                            shared_settings.ignored_apps_list.push(app_id.clone());
                         }
                         shared_settings.clone()
                     };
@@ -513,6 +514,7 @@ impl Action for VolumeControllerAction {
             return Ok(());
         };
         let app_name = channel.app_name.clone();
+        let app_id = channel.app_id.clone();
         let members = channel.member_uids.clone();
         let is_device = channel.is_device;
         channel.mute = false;
@@ -529,8 +531,8 @@ impl Action for VolumeControllerAction {
 
         let updated_settings = {
             let mut shared_settings = SHARED_SETTINGS.lock().await;
-            if !shared_settings.ignored_apps_list.contains(&app_name) {
-                shared_settings.ignored_apps_list.push(app_name.clone());
+            if !shared_settings.ignored_apps_list.contains(&app_id) {
+                shared_settings.ignored_apps_list.push(app_id.clone());
             }
             shared_settings.clone()
         };

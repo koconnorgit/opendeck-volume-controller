@@ -19,6 +19,8 @@ pub struct MixerChannel {
     pub member_uids: Vec<u32>,
     pub pid: Option<u32>,
     pub app_name: String,
+    /// Stable app identity used for exclude-list matching (see `AppInfo::app_id`).
+    pub app_id: String,
     pub sink_name: Option<String>,
     pub mute: bool,
     pub vol_percent: f32,
@@ -143,6 +145,13 @@ fn resolve_art(
     }
 }
 
+/// Whether an app is on the user's exclude list. Matches the stable app id
+/// (so an app stays excluded across track/tab/title changes) and, for backward
+/// compatibility, the display name (older entries were stored that way).
+fn is_ignored(app: &AppInfo, ignored_apps: &[String]) -> bool {
+    ignored_apps.iter().any(|n| n == &app.app_id || n == &app.app_name)
+}
+
 pub async fn create_mixer_channels(applications: Vec<AppInfo>, ignored_apps: &[String]) {
     let mut channels = MIXER_CHANNELS.lock().await;
     let mut claimed_paths: HashSet<PathBuf> = HashSet::new();
@@ -150,7 +159,7 @@ pub async fn create_mixer_channels(applications: Vec<AppInfo>, ignored_apps: &[S
 
     let mut active: Vec<AppInfo> = Vec::new();
     for app in applications.into_iter() {
-        if ignored_apps.contains(&app.app_name) {
+        if is_ignored(&app, ignored_apps) {
             println!("Skipping ignored app: {}", app.app_name);
             continue;
         }
@@ -177,6 +186,7 @@ pub async fn create_mixer_channels(applications: Vec<AppInfo>, ignored_apps: &[S
             member_uids: app.member_uids.clone(),
             pid: app.pid,
             app_name: app.app_name.clone(),
+            app_id: app.app_id.clone(),
             sink_name: app.sink_name.clone(),
             mute: app.mute,
             vol_percent: app.vol_percent,
@@ -220,7 +230,7 @@ pub async fn update_mixer_channels(
     // Build list of active apps (filtered)
     let active_apps: Vec<_> = applications
         .into_iter()
-        .filter(|app| !ignored_apps.contains(&app.app_name))
+        .filter(|app| !is_ignored(app, ignored_apps))
         .collect();
 
     // Index previous channels by UID so we can carry over name, icon, and art claims.
@@ -285,6 +295,7 @@ pub async fn update_mixer_channels(
             prev.is_device = app.is_device;
             prev.is_multi_sink_app = app.is_multi_sink_app;
             prev.member_uids = app.member_uids.clone();
+            prev.app_id = app.app_id.clone();
 
             // Make (or defer) the timing-aware art decision. No-op once resolved.
             resolve_art(
@@ -364,6 +375,7 @@ pub async fn update_mixer_channels(
                 member_uids: app.member_uids.clone(),
                 pid: app.pid,
                 app_name: display_name,
+                app_id: app.app_id.clone(),
                 sink_name: app.sink_name,
                 mute: app.mute,
                 vol_percent: app.vol_percent,

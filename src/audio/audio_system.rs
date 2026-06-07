@@ -8,6 +8,11 @@ pub struct AppInfo {
     /// carries all of its streams here so volume/mute apply to all of them.
     pub member_uids: Vec<u32>,
     pub app_name: String,
+    /// Stable, content-independent identity for the app (PulseAudio
+    /// `application.name`, e.g. "Spotify"/"Firefox"). Unlike `app_name`, it does
+    /// not change when the track/tab/window title changes, so the exclude list
+    /// keys off this to keep an app dismissed across tracks.
+    pub app_id: String,
     pub icon_search_name: String,
     pub pid: Option<u32>,
     pub sink_name: Option<String>,

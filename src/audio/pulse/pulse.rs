@@ -183,6 +183,7 @@ impl AudioSystem for PulseAudioSystem {
                 uid: default_sink.index,
                 member_uids: vec![default_sink.index],
                 app_name: system_name.clone(),
+                app_id: system_name.clone(),
                 icon_search_name: system_name,
                 pid: None,
                 sink_name: Some("System Audio".to_string()),
@@ -208,10 +209,20 @@ impl AudioSystem for PulseAudioSystem {
 
             let client = app.client.and_then(|c| client_map.get(&c));
 
+            // Stable app identity for the exclude list — independent of the
+            // track/tab/window title that drives `app_name`.
+            let app_id = app.proplist.get_str("application.name")
+                .or_else(|| app.proplist.get_str("node.name"))
+                .or_else(|| client.and_then(|c| c.name.clone()))
+                .or_else(|| app.proplist.get_str("application.process.binary"))
+                .or_else(|| app.name.clone())
+                .unwrap_or_else(|| app_name.clone());
+
             AppInfo {
                 uid: app.index,
                 member_uids: vec![app.index],
                 app_name,
+                app_id,
                 icon_search_name,
                 pid,
                 sink_name: app.name,
@@ -319,6 +330,7 @@ mod tests {
             uid,
             member_uids: vec![uid],
             app_name: name.to_string(),
+            app_id: name.to_string(),
             icon_search_name: name.to_lowercase(),
             pid,
             sink_name: None,
