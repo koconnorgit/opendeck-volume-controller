@@ -203,7 +203,7 @@ jobs:
           body_path: release_notes.md
           files: ${{ steps.plugin_name.outputs.zip_name }}
           generate_release_notes: true
-          draft: true
+          draft: false
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
