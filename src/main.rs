@@ -2,6 +2,7 @@ use openaction::OpenActionResult;
 
 mod audio;
 mod gfx;
+mod kick;
 mod mixer;
 mod mpris;
 mod plugin;

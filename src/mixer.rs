@@ -104,6 +104,13 @@ fn remember_channel_art(
 fn count_pids(apps: &[AppInfo]) -> HashMap<u32, usize> {
     let mut counts: HashMap<u32, usize> = HashMap::new();
     for app in apps {
+        // Kick streams never write a Firefox MPRIS art file, so they don't make a
+        // shared PID ambiguous for a sibling tab's cold-start claim. Counting them
+        // would wrongly block e.g. a Twitch tab from claiming its art when a Kick
+        // tab is open in the same browser process.
+        if crate::kick::kick_slug(&app.app_name).is_some() {
+            continue;
+        }
         if let Some(pid) = app.pid {
             *counts.entry(pid).or_insert(0) += 1;
         }
@@ -214,10 +221,11 @@ pub async fn create_mixer_channels(applications: Vec<AppInfo>, ignored_apps: &[S
 
     let mut col_key: u8 = 0;
     for app in active.into_iter() {
+        // A Kick avatar (when already fetched) takes the MPRIS-art slot.
         let (icon_uri, icon_uri_mute, uses_default_icon) = get_app_icon_uri(
             app.icon_name.clone(),
             app.icon_search_name.clone(),
-            None,
+            app.kick_art.as_deref(),
             app.wm_class.as_deref(),
             app.window_icon.as_ref(),
         );
@@ -238,7 +246,7 @@ pub async fn create_mixer_channels(applications: Vec<AppInfo>, ignored_apps: &[S
             icon_uri,
             icon_uri_mute,
             uses_default_icon,
-            mpris_art_data: None,
+            mpris_art_data: app.kick_art.clone(),
             mpris_art_path: None,
             // Cold start: these streams may have been playing for a while, so we
             // have no reliable timing anchor for them.
@@ -249,17 +257,26 @@ pub async fn create_mixer_channels(applications: Vec<AppInfo>, ignored_apps: &[S
             is_multi_sink_app: app.is_multi_sink_app,
         };
 
-        resolve_art(
-            &mut channel,
-            app.icon_name,
-            app.icon_search_name,
-            now,
-            &pid_counts,
-            &mut claimed_paths,
-        );
+        if crate::kick::kick_slug(&app.app_name).is_some() {
+            // Kick streams never write their own MPRIS art file; their only art
+            // source is the avatar (already in `mpris_art_data` above, if fetched).
+            // Skip the file-claim so a sibling tab's art can't be mis-attributed.
+            channel.art_resolved = true;
+        } else {
+            resolve_art(
+                &mut channel,
+                app.icon_name,
+                app.icon_search_name,
+                now,
+                &pid_counts,
+                &mut claimed_paths,
+            );
+        }
 
         let has_good_name = !crate::mpris::is_generic_name(&channel.app_name);
-        channel.locked = has_good_name && channel.art_resolved;
+        // Keep a Kick channel unlocked until its avatar fetch settles, so a later
+        // refresh can swap in the avatar instead of locking the default icon.
+        channel.locked = has_good_name && channel.art_resolved && !app.kick_pending;
 
         channels.insert(col_key, channel);
         col_key += 1;
@@ -359,15 +376,36 @@ pub async fn update_mixer_channels(
             prev.member_uids = app.member_uids.clone();
             prev.app_id = app.app_id.clone();
 
-            // Make (or defer) the timing-aware art decision. No-op once resolved.
-            resolve_art(
-                &mut prev,
-                app.icon_name.clone(),
-                app.icon_search_name.clone(),
-                now,
-                &pid_counts,
-                &mut claimed_paths,
-            );
+            if crate::kick::kick_slug(&app.app_name).is_some() {
+                // Kick streams never write their own MPRIS art file. Skip the
+                // file-claim (so a sibling tab's art can't be mis-attributed) and
+                // instead drop in the avatar once the fetch lands.
+                prev.art_resolved = true;
+                if let Some(art) = app.kick_art.as_deref().filter(|_| prev.mpris_art_data.is_none())
+                {
+                    let (icon_uri, icon_uri_mute, uses_default_icon) = get_app_icon_uri(
+                        app.icon_name.clone(),
+                        app.icon_search_name.clone(),
+                        Some(art),
+                        None,
+                        None,
+                    );
+                    prev.icon_uri = icon_uri;
+                    prev.icon_uri_mute = icon_uri_mute;
+                    prev.uses_default_icon = uses_default_icon;
+                    prev.mpris_art_data = Some(art.to_vec());
+                }
+            } else {
+                // Make (or defer) the timing-aware art decision. No-op once resolved.
+                resolve_art(
+                    &mut prev,
+                    app.icon_name.clone(),
+                    app.icon_search_name.clone(),
+                    now,
+                    &pid_counts,
+                    &mut claimed_paths,
+                );
+            }
 
             // Upgrade a generic name if a better one is now available, then lock.
             if !prev.locked {
@@ -375,7 +413,8 @@ pub async fn update_mixer_channels(
                     prev.app_name = app.app_name;
                 }
                 let has_good_name = !crate::mpris::is_generic_name(&prev.app_name);
-                prev.locked = has_good_name && prev.art_resolved;
+                // Stay unlocked while a Kick avatar fetch is still in flight.
+                prev.locked = has_good_name && prev.art_resolved && !app.kick_pending;
             }
 
             // Clear position-specific IDs (will be reassigned by update_stream_deck_buttons)
@@ -467,10 +506,11 @@ pub async fn update_mixer_channels(
                 } else {
                     (None, true)
                 };
+                // A ready Kick avatar takes the MPRIS-art slot for this new stream.
                 let (icon_uri, icon_uri_mute, uses_default_icon) = get_app_icon_uri(
                     app.icon_name.clone(),
                     app.icon_search_name.clone(),
-                    None,
+                    app.kick_art.as_deref(),
                     app.wm_class.as_deref(),
                     app.window_icon.as_ref(),
                 );
@@ -478,7 +518,7 @@ pub async fn update_mixer_channels(
                     icon_uri,
                     icon_uri_mute,
                     uses_default_icon,
-                    None,
+                    app.kick_art.clone(),
                     None,
                     first_seen,
                     art_resolved,
@@ -486,7 +526,8 @@ pub async fn update_mixer_channels(
             };
 
             let has_good_name = !crate::mpris::is_generic_name(&display_name);
-            let locked = has_good_name && art_resolved;
+            // Stay unlocked while a Kick avatar fetch is still in flight.
+            let locked = has_good_name && art_resolved && !app.kick_pending;
 
             MixerChannel {
                 header_id: None,

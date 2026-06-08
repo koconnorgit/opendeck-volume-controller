@@ -18,6 +18,7 @@ Take full control of your sound experience with fine-tuned per-app volume manage
 - **System Mixer Support**: Optional system-wide mixer control
 - **Auto-Detection**: Automatically discovers and tracks running audio applications
 - **App Icons**: Displays application icons for easy identification
+- **Kick.com streamer avatars** *(fork addition)*: Kick streams don't publish media-session art, so they'd otherwise show the generic browser icon. The plugin recovers the channel slug from the tab title and fetches the streamer's avatar from Kick's public API (requires `curl`; see Prerequisites)
 - **Real-time Updates**: Monitors PulseAudio events and updates the interface dynamically
 - **Ignore apps**: Exclude specific apps from showing in the volume controller
 - **Encoder/Dial Support** *(fork addition)*: Assign the action to an encoder dial on Stream Deck + / Stream Deck + XL. Rotate to adjust volume, press to mute, and see the app name, icon, and a live volume bar on the encoder's LCD zone.
@@ -32,6 +33,7 @@ Prerequisites:
 - Rust toolchain (`rustup` / `cargo`)
 - PulseAudio, or PipeWire with the PulseAudio compatibility layer
 - OpenDeck installed and running
+- `curl` on `PATH` — used to fetch Kick.com streamer avatars (Kick sits behind Cloudflare, which rejects pure-Rust TLS clients; everything else still works without it)
 - A sans-serif Bold font on the system for the encoder LCD title rendering — the plugin looks for Noto Sans Bold or DejaVu Sans Bold at the usual Linux font paths and silently skips the title if neither is present
 - Network access to GitHub on the first build — it pulls a patched `openaction` fork (see below)
 
