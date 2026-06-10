@@ -52,14 +52,7 @@ pub async fn sync_scroll_state() {
     let scale = PxScale::from(LCD_FONT_SIZE);
 
     for (&idx, channel) in channels.iter() {
-        let display_name = if channel.is_multi_sink_app {
-            channel
-                .sink_name
-                .clone()
-                .unwrap_or_else(|| channel.app_name.clone())
-        } else {
-            channel.app_name.clone()
-        };
+        let display_name = channel.display_label();
 
         let needs_update = match scroll.get(&idx) {
             Some(entry) => entry.text != display_name,

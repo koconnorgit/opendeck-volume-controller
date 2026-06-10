@@ -55,25 +55,37 @@ fn strip_suffix_ci<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
     }
 }
 
-/// Recover a Kick channel slug from a browser tab title (PulseAudio `media.name`).
+/// Recover a Kick channel *handle* (original case) from a browser tab title
+/// (PulseAudio `media.name`). `"PaymoneyWubby Stream - Watch Live on Kick"` ->
+/// `"PaymoneyWubby"`.
 ///
-/// Kick titles look like `"<slug> Stream - Watch Live on Kick"`. A Kick username
+/// Kick titles look like `"<handle> Stream - Watch Live on Kick"`. A Kick username
 /// is a single `[A-Za-z0-9_]` token, so once the boilerplate is stripped the
 /// remainder must be one such token — otherwise the title isn't something we can
-/// turn into an API handle and we return `None` rather than guess.
-pub fn kick_slug(media_name: &str) -> Option<String> {
+/// turn into a handle and we return `None` rather than guess.
+fn kick_handle(media_name: &str) -> Option<&str> {
     let name = media_name.trim();
     let body = strip_suffix_ci(name, " - Watch Live on Kick")
         .or_else(|| strip_suffix_ci(name, " - Kick"))?;
     let handle = strip_suffix_ci(body.trim(), " Stream").unwrap_or(body).trim();
-    if handle.is_empty() {
-        return None;
-    }
-    if handle.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        Some(handle.to_lowercase())
+    if !handle.is_empty() && handle.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        Some(handle)
     } else {
         None
     }
+}
+
+/// Lowercased handle — the slug used for Kick's API and as the avatar cache key.
+pub fn kick_slug(media_name: &str) -> Option<String> {
+    kick_handle(media_name).map(|h| h.to_lowercase())
+}
+
+/// The streamer name to show on the LCD, recovered from a Kick tab title in its
+/// original case (`"PaymoneyWubby Stream - Watch Live on Kick"` -> `"PaymoneyWubby"`).
+/// Returns the input unchanged when it isn't a recognizable Kick title, so
+/// non-Kick stream names pass through untouched.
+pub fn display_name(app_name: &str) -> String {
+    kick_handle(app_name).map_or_else(|| app_name.to_string(), |h| h.to_string())
 }
 
 /// For each Kick stream in `apps`, attach a ready avatar or mark it pending and
@@ -205,6 +217,27 @@ mod tests {
         assert_eq!(
             kick_slug("some_streamer Stream - Watch Live on Kick").as_deref(),
             Some("some_streamer")
+        );
+    }
+
+    #[test]
+    fn display_name_trims_kick_boilerplate_keeping_case() {
+        assert_eq!(
+            crate::kick::display_name("PaymoneyWubby Stream - Watch Live on Kick"),
+            "PaymoneyWubby"
+        );
+        assert_eq!(
+            crate::kick::display_name("trainwreckstv - Watch Live on Kick"),
+            "trainwreckstv"
+        );
+    }
+
+    #[test]
+    fn display_name_passes_non_kick_through_unchanged() {
+        assert_eq!(crate::kick::display_name("Spotify"), "Spotify");
+        assert_eq!(
+            crate::kick::display_name("Some Song - YouTube"),
+            "Some Song - YouTube"
         );
     }
 

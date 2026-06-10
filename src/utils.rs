@@ -139,11 +139,7 @@ pub async fn update_encoder_dial(channel: &MixerChannel, instance: &Instance) {
     } else {
         &channel.icon_uri
     };
-    let display_name = if channel.is_multi_sink_app {
-        channel.sink_name.clone().unwrap_or_else(|| channel.app_name.clone())
-    } else {
-        channel.app_name.clone()
-    };
+    let display_name = channel.display_label();
     match crate::gfx::get_encoder_lcd_data_uri(icon, &display_name, channel.vol_percent, channel.mute, 0.0) {
         Ok(uri) => {
             let _ = instance.set_image(Some(uri), None).await;

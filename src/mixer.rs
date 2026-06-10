@@ -47,6 +47,21 @@ pub struct MixerChannel {
     pub is_multi_sink_app: bool,
 }
 
+impl MixerChannel {
+    /// Text shown on the LCD / header for this channel. Collapsed multi-sink apps
+    /// show the sink name; everything else shows the stream name, with Kick tab
+    /// titles trimmed to just the streamer handle. The full
+    /// `"<handle> Stream - Watch Live on Kick"` is kept in `app_name` (the avatar
+    /// fetch and Kick detection key off it) but is too long/noisy to display.
+    pub fn display_label(&self) -> String {
+        if self.is_multi_sink_app {
+            self.sink_name.clone().unwrap_or_else(|| self.app_name.clone())
+        } else {
+            crate::kick::display_name(&self.app_name)
+        }
+    }
+}
+
 pub static MIXER_CHANNELS: LazyLock<Mutex<HashMap<u8, MixerChannel>>> =
     LazyLock::new(|| Mutex::const_new(HashMap::new()));
 
