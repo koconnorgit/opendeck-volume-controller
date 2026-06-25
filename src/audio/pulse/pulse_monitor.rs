@@ -168,7 +168,8 @@ fn start_refresh_processor() {
 pub async fn refresh_audio_applications() -> Result<(), Box<dyn std::error::Error>> {
     // Get current applications (same logic as manual-detection)
     let mut applications = {
-        let mut audio_system = audio::create();
+        let mut audio_system = audio::create()
+            .map_err(|e| format!("Audio system unavailable: {:?}", e))?;
         audio_system
             .list_applications()
             .map_err(|e| format!("Error fetching applications: {:?}", e))?

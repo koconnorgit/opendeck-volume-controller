@@ -11,6 +11,10 @@ use crate::plugin::{COLUMN_TO_CHANNEL_MAP, VolumeControllerAction};
 
 const MAX_TITLE_CHARS_BEFORE_TRUNCATION: usize = 8;
 
+/// The generic fallback icon, embedded in the binary so it is always available
+/// regardless of the process working directory. See `resolve_icon_source`.
+const DEFAULT_ICON: &[u8] = include_bytes!("../img/wave-sound.png");
+
 // Global flag to track if system mixer should be shown
 static SHOW_SYSTEM_MIXER: AtomicBool = AtomicBool::new(false);
 
@@ -257,9 +261,11 @@ fn resolve_icon_source(
         return (wi.png.clone(), "image/png".to_string(), false);
     }
 
-    // 5. Bundled default.
-    let bytes = std::fs::read("img/wave-sound.png").unwrap_or_default();
-    (bytes, "image/png".to_string(), true)
+    // 5. Bundled default. Embedded at compile time so the fallback icon can never
+    // silently become a blank image — reading it from a relative path would depend
+    // on the plugin's working directory being the sdPlugin dir, an undocumented
+    // assumption that, if it ever changed, would break every default icon at once.
+    (DEFAULT_ICON.to_vec(), "image/png".to_string(), true)
 }
 
 /// Get application icon as base64 data URIs.

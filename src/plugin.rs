@@ -305,14 +305,16 @@ impl Action for VolumeControllerAction {
                     drop(channels);
                     drop(column_map);
 
-                    {
-                        let mut audio_system = audio::create();
-                        for uid in &members {
-                            if let Err(e) = audio_system.mute_volume(*uid, false, is_device) {
-                                println!("Warning: Failed to unmute audio: {}", e);
+                    match audio::create() {
+                        Ok(mut audio_system) => {
+                            for uid in &members {
+                                if let Err(e) = audio_system.mute_volume(*uid, false, is_device) {
+                                    println!("Warning: Failed to unmute audio: {}", e);
+                                }
                             }
                         }
-                    } // audio_system is dropped here
+                        Err(e) => println!("Warning: audio system unavailable: {}", e),
+                    }
 
                     // Read cached shared settings, append app, and save back
                     let updated_settings = {
@@ -369,7 +371,10 @@ impl Action for VolumeControllerAction {
                     channel.mute = !channel.mute;
                     let mute = channel.mute;
                     let is_device = channel.is_device;
-                    let mut audio_system = audio::create();
+                    let Ok(mut audio_system) = audio::create() else {
+                        println!("Warning: audio system unavailable");
+                        return Ok(());
+                    };
                     for uid in &channel.member_uids {
                         if let Err(e) = audio_system.mute_volume(*uid, mute, is_device) {
                             println!("Warning: Failed to toggle mute for {}: {}", channel.app_name, e);
@@ -384,7 +389,10 @@ impl Action for VolumeControllerAction {
 
                     let is_device = channel.is_device;
                     let increment = SHARED_SETTINGS.lock().await.volume_increment;
-                    let mut audio_system = audio::create();
+                    let Ok(mut audio_system) = audio::create() else {
+                        println!("Warning: audio system unavailable");
+                        return Ok(());
+                    };
                     for uid in &channel.member_uids {
                         if let Err(e) = audio_system.increase_volume(*uid, increment, is_device) {
                             println!("Warning: Failed to increase volume for {}: {}", channel.app_name, e);
@@ -395,7 +403,10 @@ impl Action for VolumeControllerAction {
                 2 => {
                     let is_device = channel.is_device;
                     let increment = SHARED_SETTINGS.lock().await.volume_increment;
-                    let mut audio_system = audio::create();
+                    let Ok(mut audio_system) = audio::create() else {
+                        println!("Warning: audio system unavailable");
+                        return Ok(());
+                    };
                     for uid in &channel.member_uids {
                         if let Err(e) = audio_system.decrease_volume(*uid, increment, is_device) {
                             println!("Warning: Failed to decrease volume for {}: {}", channel.app_name, e);
@@ -435,7 +446,10 @@ impl Action for VolumeControllerAction {
 
         let increment = SHARED_SETTINGS.lock().await.volume_increment * ticks.abs() as f64;
 
-        let mut audio = audio::create();
+        let Ok(mut audio) = audio::create() else {
+            println!("Warning: audio system unavailable");
+            return Ok(());
+        };
         for uid in &members {
             if ticks > 0 {
                 let _ = audio.increase_volume(*uid, increment, is_device);
@@ -466,7 +480,10 @@ impl Action for VolumeControllerAction {
         let is_device = channel.is_device;
         drop(channels);
 
-        let mut audio = audio::create();
+        let Ok(mut audio) = audio::create() else {
+            println!("Warning: audio system unavailable");
+            return Ok(());
+        };
         for uid in &members {
             let _ = audio.mute_volume(*uid, mute, is_device);
         }
@@ -500,7 +517,10 @@ impl Action for VolumeControllerAction {
             let is_device = channel.is_device;
             drop(channels);
 
-            let mut audio = audio::create();
+            let Ok(mut audio) = audio::create() else {
+                println!("Warning: audio system unavailable");
+                return Ok(());
+            };
             for uid in &members {
                 let _ = audio.mute_volume(*uid, mute, is_device);
             }
@@ -520,13 +540,15 @@ impl Action for VolumeControllerAction {
         channel.mute = false;
         drop(channels);
 
-        {
-            let mut audio = audio::create();
-            for uid in &members {
-                if let Err(e) = audio.mute_volume(*uid, false, is_device) {
-                    println!("Warning: Failed to unmute audio: {}", e);
+        match audio::create() {
+            Ok(mut audio) => {
+                for uid in &members {
+                    if let Err(e) = audio.mute_volume(*uid, false, is_device) {
+                        println!("Warning: Failed to unmute audio: {}", e);
+                    }
                 }
             }
+            Err(e) => println!("Warning: audio system unavailable: {}", e),
         }
 
         let updated_settings = {
@@ -558,12 +580,18 @@ pub async fn init() -> OpenActionResult<()> {
     // start listening to changes
     audio::pulse::start_pulse_monitoring();
 
-    // create initial map (ignored apps will be loaded via did_receive_global_settings)
-    let mut applications = {
-        let mut audio_system = create();
-        audio_system
-            .list_applications()
-            .expect("Error fetching applications from SinkController")
+    // create initial map (ignored apps will be loaded via did_receive_global_settings).
+    // If PulseAudio isn't ready yet, start empty and let the monitor populate us on
+    // its first event rather than refusing to start the plugin at all.
+    let mut applications = match create() {
+        Ok(mut audio_system) => audio_system.list_applications().unwrap_or_else(|e| {
+            println!("Warning: initial application list failed: {}", e);
+            Vec::new()
+        }),
+        Err(e) => {
+            println!("Warning: PulseAudio unavailable at startup: {}", e);
+            Vec::new()
+        }
     };
 
     // Recover real names for streams whose media.name is generic (e.g. Kick.com).

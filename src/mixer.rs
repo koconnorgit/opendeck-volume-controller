@@ -420,6 +420,29 @@ pub async fn update_mixer_channels(
                     &pid_counts,
                     &mut claimed_paths,
                 );
+
+                // The icon is only computed when a channel is first created, but
+                // an app's XWayland window (and thus its `window_icon`/`wm_class`
+                // and the themed icon those unlock) can become resolvable a
+                // refresh or two *after* the audio stream first appears — by which
+                // point the art/lock machinery above would otherwise freeze the
+                // generic default icon in place forever. So while this channel is
+                // still on the default icon, keep re-resolving from the latest
+                // enrichment. Once a real icon lands `uses_default_icon` flips
+                // false and this stops; it runs regardless of `locked` because a
+                // window that maps late must still be able to upgrade the icon.
+                if prev.uses_default_icon {
+                    let (icon_uri, icon_uri_mute, uses_default_icon) = get_app_icon_uri(
+                        app.icon_name.clone(),
+                        app.icon_search_name.clone(),
+                        prev.mpris_art_data.as_deref(),
+                        app.wm_class.as_deref(),
+                        app.window_icon.as_ref(),
+                    );
+                    prev.icon_uri = icon_uri;
+                    prev.icon_uri_mute = icon_uri_mute;
+                    prev.uses_default_icon = uses_default_icon;
+                }
             }
 
             // Upgrade a generic name if a better one is now available, then lock.
