@@ -7,11 +7,21 @@ use libpulse_binding::{
     mainloop::threaded::Mainloop,
     proplist::Proplist,
 };
+use std::collections::HashSet;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex as StdMutex;
 use tokio::sync::mpsc;
 
 static MONITOR_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Sink-input uids present on the previous refresh. A muted browser stream whose
+/// uid is *not* in here is brand new, so its mute can only have come from
+/// PulseAudio's `module-stream-restore` replaying the last mute we set against the
+/// per-app `sink-input-by-application-name` key. See
+/// [`unmute_restored_browser_streams`].
+static SEEN_STREAM_UIDS: LazyLock<StdMutex<HashSet<u32>>> =
+    LazyLock::new(|| StdMutex::new(HashSet::new()));
 
 // Global channel for refresh requests
 static REFRESH_CHANNEL: LazyLock<(
@@ -130,6 +140,77 @@ pub fn start_pulse_monitoring() {
     });
 }
 
+/// Unmute browser streams that came up muted only because PulseAudio's
+/// `module-stream-restore` replayed a previous mute.
+///
+/// Every browser tab shares one restore key (`sink-input-by-application-name:Firefox`),
+/// so muting one tab from the Stream Deck makes PulseAudio start every *new* tab
+/// muted. We can't tell PulseAudio "don't persist this", so instead we watch for
+/// brand-new muted browser streams (a uid we didn't see last refresh) and unmute
+/// them. Streams we saw before are left untouched, so a tab the user actively
+/// muted stays muted. The unmute also writes `mute=false` back to the restore
+/// entry, so the persisted state self-heals.
+fn unmute_restored_browser_streams(applications: &mut [audio::AppInfo]) {
+    let to_unmute = {
+        let mut seen = SEEN_STREAM_UIDS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        select_restored_browser_unmutes(applications, &mut seen)
+    };
+
+    if to_unmute.is_empty() {
+        return;
+    }
+
+    match audio::create() {
+        Ok(mut audio_system) => {
+            for uid in to_unmute {
+                match audio_system.mute_volume(uid, false, false) {
+                    Ok(()) => println!(
+                        "Unmuted new browser stream {} (cleared stream-restore mute)",
+                        uid
+                    ),
+                    Err(e) => eprintln!("Failed to unmute browser stream {}: {}", uid, e),
+                }
+            }
+        }
+        Err(e) => eprintln!("Audio system unavailable to unmute browser stream: {:?}", e),
+    }
+}
+
+/// Pure half of [`unmute_restored_browser_streams`]: flip each newly seen muted
+/// browser stream to unmuted, return the member uids to unmute on PulseAudio, and
+/// refresh `seen` to the streams present now. Split out so it can be tested
+/// without a live PulseAudio.
+fn select_restored_browser_unmutes(
+    applications: &mut [audio::AppInfo],
+    seen: &mut HashSet<u32>,
+) -> Vec<u32> {
+    let mut to_unmute: Vec<u32> = Vec::new();
+    for app in applications.iter_mut() {
+        // Only an unseen (new) muted browser stream is a restore-inheritance
+        // victim. An already-seen muted stream was muted on purpose.
+        if !app.is_device
+            && app.is_browser
+            && app.mute
+            && app.member_uids.iter().all(|u| !seen.contains(u))
+        {
+            to_unmute.extend(app.member_uids.iter().copied());
+            app.mute = false;
+        }
+    }
+
+    // Rebuild the seen-set from the streams present now: closed tabs drop out (so a
+    // reused sink-input index counts as new again) and the tabs we just handled
+    // count as seen next time.
+    seen.clear();
+    for app in applications.iter().filter(|a| !a.is_device) {
+        seen.extend(app.member_uids.iter().copied());
+    }
+
+    to_unmute
+}
+
 fn start_refresh_processor() {
     // Take the receiver from the global channel
     let receiver = REFRESH_CHANNEL.1.lock().unwrap().take();
@@ -175,6 +256,10 @@ pub async fn refresh_audio_applications() -> Result<(), Box<dyn std::error::Erro
             .map_err(|e| format!("Error fetching applications: {:?}", e))?
     };
 
+    // A freshly opened browser tab inherits the last mute we applied via
+    // module-stream-restore; unmute it so new tabs start audible.
+    unmute_restored_browser_streams(&mut applications);
+
     // Recover real names for streams whose media.name is generic (e.g. Kick.com).
     crate::mpris::enrich_generic_names(&mut applications).await;
 
@@ -196,4 +281,110 @@ pub async fn refresh_audio_applications() -> Result<(), Box<dyn std::error::Erro
     utils::update_stream_deck_buttons().await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream(uid: u32, is_browser: bool, mute: bool) -> audio::AppInfo {
+        audio::AppInfo {
+            uid,
+            member_uids: vec![uid],
+            app_name: "stream".to_string(),
+            app_id: "stream".to_string(),
+            icon_search_name: "stream".to_string(),
+            pid: None,
+            sink_name: None,
+            mute,
+            vol_percent: 100.0,
+            icon_name: None,
+            is_device: false,
+            is_browser,
+            is_multi_sink_app: false,
+            client_pid: None,
+            client_name: None,
+            client_binary: None,
+            wm_class: None,
+            window_icon: None,
+            kick_art: None,
+            kick_pending: false,
+        }
+    }
+
+    #[test]
+    fn unmutes_new_muted_browser_stream() {
+        // A tab we've never seen, muted only because module-stream-restore replayed
+        // the per-app mute, gets unmuted.
+        let mut seen = HashSet::new();
+        let mut apps = vec![stream(7, true, true)];
+
+        let unmute = select_restored_browser_unmutes(&mut apps, &mut seen);
+
+        assert_eq!(unmute, vec![7]);
+        assert!(!apps[0].mute, "the new tab is reported as unmuted");
+        assert!(seen.contains(&7), "the handled tab is now seen");
+    }
+
+    #[test]
+    fn leaves_already_seen_muted_browser_stream_alone() {
+        // The tab the user actively muted (already seen) must stay muted.
+        let mut seen = HashSet::from([7]);
+        let mut apps = vec![stream(7, true, true)];
+
+        let unmute = select_restored_browser_unmutes(&mut apps, &mut seen);
+
+        assert!(unmute.is_empty());
+        assert!(apps[0].mute, "the deliberately muted tab stays muted");
+    }
+
+    #[test]
+    fn ignores_non_browser_and_device_streams() {
+        // A muted non-browser app (e.g. a game) and a muted device are never touched
+        // — only browsers suffer the shared-restore-key inheritance.
+        let mut seen = HashSet::new();
+        let mut device = stream(2, false, true);
+        device.is_device = true;
+        let mut apps = vec![stream(1, false, true), device];
+
+        let unmute = select_restored_browser_unmutes(&mut apps, &mut seen);
+
+        assert!(unmute.is_empty());
+        assert!(apps[0].mute && apps[1].mute, "neither is unmuted");
+    }
+
+    #[test]
+    fn new_then_seen_across_refreshes() {
+        // First refresh: a new muted tab is unmuted. Second refresh with the same
+        // (now unmuted) tab leaves it alone, and a user-mute that lands after is kept.
+        let mut seen = HashSet::new();
+
+        let mut first = vec![stream(7, true, true)];
+        assert_eq!(select_restored_browser_unmutes(&mut first, &mut seen), vec![7]);
+
+        // Same tab returns, now muted by the user via the Stream Deck.
+        let mut second = vec![stream(7, true, true)];
+        let unmute = select_restored_browser_unmutes(&mut second, &mut seen);
+        assert!(unmute.is_empty());
+        assert!(second[0].mute, "a seen tab the user muted is preserved");
+    }
+
+    #[test]
+    fn closed_tab_drops_from_seen_so_reused_uid_counts_as_new() {
+        // uid 7 seen, then the tab closes (absent from the next refresh). When uid 7
+        // is later reused by a brand-new muted tab, it must be treated as new again.
+        let mut seen = HashSet::new();
+        let mut present = vec![stream(7, true, false)];
+        select_restored_browser_unmutes(&mut present, &mut seen);
+        assert!(seen.contains(&7));
+
+        // Refresh with no streams: uid 7 drops out of the seen-set.
+        let mut empty: Vec<audio::AppInfo> = vec![];
+        select_restored_browser_unmutes(&mut empty, &mut seen);
+        assert!(!seen.contains(&7));
+
+        // uid 7 reused by a new muted tab → unmuted.
+        let mut reused = vec![stream(7, true, true)];
+        assert_eq!(select_restored_browser_unmutes(&mut reused, &mut seen), vec![7]);
+    }
 }

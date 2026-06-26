@@ -191,6 +191,7 @@ impl AudioSystem for PulseAudioSystem {
                 vol_percent: get_pulse_app_volume_percentage(&default_sink.volume),
                 icon_name: Some("audio-card".to_string()),
                 is_device: true,
+                is_browser: false,
                 is_multi_sink_app: false,
                 client_pid: None,
                 client_name: None,
@@ -205,6 +206,7 @@ impl AudioSystem for PulseAudioSystem {
         let streams: Vec<AppInfo> = apps.into_iter().map(|app| {
             let app_name = get_display_name(&app);
             let icon_search_name = get_icon_search_name(&app);
+            let is_browser = classify_node(&app).1;
 
             let pid = app.proplist.get_str("application.process.id")
                 .and_then(|s| s.parse::<u32>().ok());
@@ -232,6 +234,7 @@ impl AudioSystem for PulseAudioSystem {
                 vol_percent: get_pulse_app_volume_percentage(&app.volume),
                 icon_name: app.proplist.get_str("application.icon_name"),
                 is_device: false,
+                is_browser,
                 is_multi_sink_app: false, // recomputed below, after collapsing
                 client_pid: client.and_then(|c| c.pid),
                 client_name: client.and_then(|c| c.name.clone()),
@@ -342,6 +345,7 @@ mod tests {
             vol_percent: vol,
             icon_name: None,
             is_device: false,
+            is_browser: false,
             is_multi_sink_app: false,
             client_pid: None,
             client_name: None,

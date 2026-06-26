@@ -20,6 +20,12 @@ pub struct AppInfo {
     pub vol_percent: f32,
     pub icon_name: Option<String>,
     pub is_device: bool,
+    /// True for browser sink-inputs (Firefox/Chrome/…). Browsers route every tab
+    /// through one `module-stream-restore` key (`sink-input-by-application-name`),
+    /// so a mute applied to one tab is replayed onto newly opened tabs. The
+    /// refresh path uses this flag to unmute freshly opened tabs. See
+    /// `pulse_monitor::unmute_restored_browser_streams`.
+    pub is_browser: bool,
     pub is_multi_sink_app: bool,
     /// PID from the owning PulseAudio *client* proplist. For some apps (e.g.
     /// pipewire-native ones) the sink-input has no PID but the client does.
