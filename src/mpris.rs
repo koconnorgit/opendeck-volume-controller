@@ -166,7 +166,7 @@ const TITLE_SUFFIXES: &[&str] = &[
 
 /// Strip known site boilerplate suffixes from a page title.
 /// "PaymoneyWubby Stream - Watch Live on Kick" -> "PaymoneyWubby Stream"
-fn clean_stream_title(title: &str) -> String {
+pub(crate) fn clean_stream_title(title: &str) -> String {
     let trimmed = title.trim();
     for suffix in TITLE_SUFFIXES {
         if trimmed.len() >= suffix.len()
@@ -244,6 +244,22 @@ pub async fn enrich_generic_names(apps: &mut [AppInfo]) {
         return;
     }
 
+    // Names already held by a non-generic live stream, keyed by PID. A browser
+    // process exposes a single MPRIS player reflecting its *active* media
+    // session, so its title may belong to a sibling tab rather than the generic
+    // stream we're enriching. If the title already names another live stream in
+    // the same process, copying it onto this one would just duplicate that
+    // sibling's identity — exactly what happens to a stream that briefly reports
+    // a generic media.name after an in-browser mute/unmute recreates it. Skip
+    // those; the mixer recovers such a returning stream's real identity from its
+    // remembered art instead (see `mixer::update_mixer_channels`).
+    let owned_names: HashSet<(u32, String)> = apps
+        .iter()
+        .filter_map(|a| a.pid.map(|pid| (pid, a)))
+        .filter(|(_, a)| !is_generic_name(&a.app_name))
+        .map(|(pid, a)| (pid, a.app_name.to_lowercase()))
+        .collect();
+
     for app in apps.iter_mut() {
         let Some(pid) = app.pid else { continue };
         if !is_generic_name(&app.app_name) {
@@ -255,7 +271,10 @@ pub async fn enrich_generic_names(apps: &mut [AppInfo]) {
             }
             if let Some(title) = mpris_title(&conn, name).await {
                 let cleaned = clean_stream_title(&title);
-                if !cleaned.is_empty() && !is_generic_name(&cleaned) {
+                if !cleaned.is_empty()
+                    && !is_generic_name(&cleaned)
+                    && !owned_names.contains(&(pid, cleaned.to_lowercase()))
+                {
                     app.app_name = cleaned;
                     break;
                 }

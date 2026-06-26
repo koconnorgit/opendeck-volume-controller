@@ -360,7 +360,7 @@ mod tests {
             app(101, Some(3651136), "Gothic 1 Remake", 76.0, false),
             app(102, Some(3651136), "Gothic 1 Remake", 46.0, false),
             app(103, Some(3651136), "Gothic 1 Remake", 78.0, false),
-            app(200, Some(1577), "MidnightSumo - Twitch", 50.0, false),
+            app(200, Some(1577), "Example Stream - Twitch", 50.0, false),
         ]);
 
         assert_eq!(out.len(), 2, "Gothic's 3 streams collapse to 1, Firefox stays");

@@ -114,6 +114,51 @@ fn remember_channel_art(
     );
 }
 
+/// Re-identify a stream that Firefox tagged with the wrong title. A freshly
+/// created sink-input can inherit the browser's *active* Media Session title
+/// instead of its own tab's (e.g. Twitch unmuted in-browser while a YouTube
+/// video is the active session comes back wearing the video's title). When that
+/// mis-tag is detected (the name collides with a live sibling on the same PID),
+/// the true identity is recovered here: if exactly one remembered identity on
+/// this PID is *not* currently held by a live stream, it is almost certainly
+/// this returning stream. Returns its name (the caller's art-inheritance then
+/// restores the matching art). Ambiguous/empty cases return `None`, never a
+/// guess. `live_names` holds the lowercased names of every live stream this
+/// refresh, so an identity still on screen is never reused.
+fn recover_identity_from_memory(pid: u32, live_names: &HashSet<String>) -> Option<String> {
+    let mem = ART_MEMORY.lock().unwrap();
+    let mut dormant = mem
+        .keys()
+        .filter(|(p, name)| *p == pid && !live_names.contains(&name.to_lowercase()))
+        .map(|(_, name)| name.clone());
+    let candidate = dormant.next()?;
+    if dormant.next().is_some() {
+        return None; // Ambiguous — don't guess which returning stream this is.
+    }
+    Some(candidate)
+}
+
+/// Look up remembered art for a *confirmed* logical identity (PID + name) and
+/// return it unless a still-active stream already holds that file. Used to
+/// restore an avatar/art the instant the browser re-publishes a stream's real
+/// `media.name` after it briefly reported a generic one (e.g. an in-browser
+/// mute/unmute recreated the sink-input). Keyed on the confirmed name, so it
+/// can never graft an unrelated stream's art onto this one.
+fn remembered_art_for(
+    pid: u32,
+    name: &str,
+    claimed_paths: &HashSet<PathBuf>,
+) -> Option<(PathBuf, Vec<u8>)> {
+    let mem = ART_MEMORY.lock().unwrap();
+    mem.get(&(pid, name.to_string())).and_then(|a| {
+        if claimed_paths.contains(&a.path) {
+            None
+        } else {
+            Some((a.path.clone(), a.data.clone()))
+        }
+    })
+}
+
 /// Count how many active streams share each PID, so the cold-start art claim can
 /// tell an unambiguous single-stream PID from an ambiguous multi-stream one.
 fn count_pids(apps: &[AppInfo]) -> HashMap<u32, usize> {
@@ -327,6 +372,30 @@ pub async fn update_mixer_channels(
     let now = SystemTime::now();
     let pid_counts = count_pids(&active_apps);
 
+    // Count cleaned media.names per PID across all live streams. A count > 1 means
+    // two streams in one browser process share a (cleaned) title — the tell-tale
+    // that Firefox tagged a freshly-created sink-input with the active session's
+    // title instead of its own tab's. Such a name must not be trusted as identity.
+    let mut cleaned_name_counts: HashMap<(u32, String), usize> = HashMap::new();
+    for a in &active_apps {
+        if let Some(pid) = a.pid {
+            let key = (pid, crate::mpris::clean_stream_title(&a.app_name).to_lowercase());
+            *cleaned_name_counts.entry(key).or_insert(0) += 1;
+        }
+    }
+    // Whether a stream's media.name duplicates another live sibling on its PID.
+    let title_collides = |pid: Option<u32>, name: &str| -> bool {
+        pid.map_or(false, |pid| {
+            let key = (pid, crate::mpris::clean_stream_title(name).to_lowercase());
+            cleaned_name_counts.get(&key).copied().unwrap_or(0) > 1
+        })
+    };
+
+    // Lowercased names of every live stream this refresh, so identity recovery
+    // never re-adopts an identity that is still on screen.
+    let live_names: HashSet<String> =
+        active_apps.iter().map(|a| a.app_name.to_lowercase()).collect();
+
     // Remember every prior channel's art by logical identity *before* processing.
     // This deliberately captures streams that are about to disappear this refresh
     // (their uid is gone from the active set): a recreated stream's successor,
@@ -355,8 +424,13 @@ pub async fn update_mixer_channels(
             // art, and reset to a default icon. Re-claim is deferred to the
             // delayed refresh — the new MPRIS art file may not be written
             // yet at this exact moment.
+            // A "shift" to a title that collides with a live sibling is Firefox
+            // re-tagging this stream with the active session's title, not a real
+            // content change — ignore it so a recovered identity (below) is not
+            // re-corrupted on every refresh by the persistent wrong media.name.
             let name_shifted = !crate::mpris::is_generic_name(&app.app_name)
-                && app.app_name != prev.app_name;
+                && app.app_name != prev.app_name
+                && !title_collides(app.pid, &app.app_name);
 
             if name_shifted {
                 prev.locked = false;
@@ -380,6 +454,26 @@ pub async fn update_mixer_channels(
                 prev.icon_uri = icon_uri;
                 prev.icon_uri_mute = icon_uri_mute;
                 prev.uses_default_icon = uses_default_icon;
+
+                // If this now-confirmed identity has art remembered from before it
+                // briefly went generic (e.g. an in-browser mute/unmute), restore it
+                // immediately instead of waiting on a fresh art file the browser may
+                // never rewrite. Keyed on the confirmed name, so it can't graft
+                // another stream's art.
+                if let Some((path, data)) = app
+                    .pid
+                    .and_then(|pid| remembered_art_for(pid, &prev.app_name, &claimed_paths))
+                {
+                    apply_art(
+                        &mut prev,
+                        app.icon_name.clone(),
+                        app.icon_search_name.clone(),
+                        path,
+                        data,
+                        &mut claimed_paths,
+                    );
+                    prev.art_resolved = true;
+                }
             }
 
             // Update live data
@@ -466,21 +560,26 @@ pub async fn update_mixer_channels(
             // not have written the art file for this stream yet (the file on disk
             // could still be from the previous stream). The delayed refresh (2s
             // later) will make a claim against the updated filesystem state.
-            // For generic names, borrow a better name from an existing slot on the same PID.
-            let display_name = if crate::mpris::is_generic_name(&app.app_name) {
-                if let Some(pid) = app.pid {
-                    previous_by_uid
-                        .values()
-                        .chain(new_channels.values())
-                        .find(|ch| {
-                            ch.pid == Some(pid)
-                                && !crate::mpris::is_generic_name(&ch.app_name)
-                        })
-                        .map(|ch| ch.app_name.clone())
-                        .unwrap_or(app.app_name.clone())
-                } else {
-                    app.app_name.clone()
+            // A new sink-input that reports a generic name, or a title that
+            // collides with a live sibling on its PID (Firefox tagged it with the
+            // active Media Session's title rather than its own), can't be trusted
+            // to name itself. Recover its true identity from the art memory — the
+            // unique recently-departed identity on this PID. The art-inheritance
+            // below then restores its avatar by that recovered name. A genuinely
+            // new tab with a unique title isn't a collision, so it's left alone.
+            let untrustworthy_name = crate::mpris::is_generic_name(&app.app_name)
+                || title_collides(app.pid, &app.app_name);
+            let display_name = if untrustworthy_name {
+                let recovered = app
+                    .pid
+                    .and_then(|pid| recover_identity_from_memory(pid, &live_names));
+                if let Some(name) = &recovered {
+                    println!(
+                        "Recovered identity {:?} for returning stream uid={} (reported {:?})",
+                        name, app.uid, app.app_name,
+                    );
                 }
+                recovered.unwrap_or_else(|| app.app_name.clone())
             } else {
                 app.app_name.clone()
             };
@@ -613,4 +712,117 @@ pub async fn update_mixer_channels(
         "Updated mixer channels (filtered {} ignored apps)",
         ignored_apps.len()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn remember(pid: u32, name: &str, path: &str) {
+        let mut mem = ART_MEMORY.lock().unwrap();
+        mem.insert(
+            (pid, name.to_string()),
+            RememberedArt {
+                path: PathBuf::from(path),
+                data: vec![1u8, 2, 3],
+                last_seen: SystemTime::now(),
+            },
+        );
+    }
+
+    fn forget(pid: u32) {
+        ART_MEMORY.lock().unwrap().retain(|(p, _), _| *p != pid);
+    }
+
+    // Each test uses a private PID so the process-global ART_MEMORY stays isolated.
+
+    #[test]
+    fn restores_remembered_art_for_confirmed_identity() {
+        // After a stream's real media.name is re-confirmed, its prior art is
+        // restored — keyed on PID + the confirmed name only.
+        let pid = 900_001;
+        forget(pid);
+        remember(pid, "Example Stream - Twitch", "/run/firefox-mpris/900001_1.png");
+        let got = remembered_art_for(pid, "Example Stream - Twitch", &HashSet::new());
+        assert_eq!(
+            got,
+            Some((PathBuf::from("/run/firefox-mpris/900001_1.png"), vec![1u8, 2, 3]))
+        );
+        forget(pid);
+    }
+
+    #[test]
+    fn does_not_restore_a_different_identitys_art() {
+        // A different identity remembered on the same PID must not be returned —
+        // the key is PID + exact name, never PID alone. (Names here are synthetic
+        // placeholders; real names only ever enter the table at runtime.)
+        let pid = 900_002;
+        forget(pid);
+        remember(pid, "Example Video - YouTube", "/run/firefox-mpris/900002_1.png");
+        assert_eq!(remembered_art_for(pid, "Example Stream - Twitch", &HashSet::new()), None);
+        forget(pid);
+    }
+
+    #[test]
+    fn never_steals_art_a_live_stream_still_holds() {
+        let pid = 900_003;
+        let path = "/run/firefox-mpris/900003_1.png";
+        forget(pid);
+        remember(pid, "Example Stream - Twitch", path);
+        let claimed: HashSet<PathBuf> = [PathBuf::from(path)].into_iter().collect();
+        assert_eq!(remembered_art_for(pid, "Example Stream - Twitch", &claimed), None);
+        forget(pid);
+    }
+
+    #[test]
+    fn no_memory_for_identity_yields_nothing() {
+        let pid = 900_004;
+        forget(pid);
+        assert_eq!(remembered_art_for(pid, "Anything", &HashSet::new()), None);
+    }
+
+    fn live(names: &[&str]) -> HashSet<String> {
+        names.iter().map(|n| n.to_lowercase()).collect()
+    }
+
+    // Names below are synthetic placeholders standing in for whatever a session
+    // actually played — real names only enter ART_MEMORY at runtime, never here.
+
+    #[test]
+    fn recovers_lone_dormant_identity_for_mis_tagged_stream() {
+        // A returning stream wears a live video's title; its own remembered
+        // identity is the only one remembered-but-absent, so it's recovered.
+        let pid = 900_101;
+        forget(pid);
+        remember(pid, "Example Stream - Twitch", "/run/firefox-mpris/900101_1.png");
+        let live = live(&["example video - youtube", "example video"]);
+        assert_eq!(
+            recover_identity_from_memory(pid, &live).as_deref(),
+            Some("Example Stream - Twitch")
+        );
+        forget(pid);
+    }
+
+    #[test]
+    fn does_not_reuse_an_identity_still_on_screen() {
+        let pid = 900_102;
+        forget(pid);
+        remember(pid, "Example Stream - Twitch", "/run/firefox-mpris/900102_1.png");
+        // That stream is still live — nothing dormant to recover.
+        assert_eq!(
+            recover_identity_from_memory(pid, &live(&["example stream - twitch"])),
+            None
+        );
+        forget(pid);
+    }
+
+    #[test]
+    fn refuses_to_guess_between_multiple_dormant_identities() {
+        let pid = 900_103;
+        forget(pid);
+        remember(pid, "Example Stream A - Twitch", "/run/firefox-mpris/900103_1.png");
+        remember(pid, "Example Stream B - Twitch", "/run/firefox-mpris/900103_2.png");
+        assert_eq!(recover_identity_from_memory(pid, &live(&[])), None);
+        forget(pid);
+    }
 }
